@@ -4,7 +4,7 @@
 
 ## Overview
 
-A minimal web app for voice conversations with Clawd (Claude). Speak into mic → Whisper transcribes → Gateway sends to Claude → TTS speaks response. Accessible from iPhone/Mac over Tailscale.
+A minimal web app for voice conversations with Clawd (Claude). Speak into mic → Parakeet transcribes locally → Gateway sends to Claude → TTS speaks response. Accessible from iPhone/Mac over Tailscale.
 
 **Key benefit:** Keeps Claude as the AI with full OpenClaw context, memory, and tools.
 
@@ -16,7 +16,7 @@ A minimal web app for voice conversations with Clawd (Claude). Speak into mic �
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │   Mic    │───▶│   VAD    │───▶│ Whisper  │───▶│ Gateway  │  │
+│  │   Mic    │───▶│   VAD    │───▶│ Parakeet │───▶│ Gateway  │  │
 │  │  Input   │    │ (Silero) │    │   STT    │    │    WS    │  │
 │  └──────────┘    └──────────┘    └──────────┘    └────┬─────┘  │
 │                                                        │        │
@@ -26,16 +26,17 @@ A minimal web app for voice conversations with Clawd (Claude). Speak into mic �
 │  └──────────┘    └──────────┘                                   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                OpenClaw Gateway (localhost:18789)                │
-│                                                                  │
-│  • WebSocket protocol (chat.send / chat events)                 │
-│  • Routes to Claude with full context                           │
-│  • Maintains conversation history                                │
-│  • Access to all tools (calendar, email, etc.)                  │
-└─────────────────────────────────────────────────────────────────┘
+             │                                │
+             ▼                                ▼
+┌───────────────────────────┐  ┌─────────────────────────────────┐
+│  Parakeet Server          │  │  OpenClaw Gateway               │
+│  (Apple Silicon MacBook)  │  │  (localhost:18789)              │
+│                           │  │                                 │
+│  • POST /transcribe       │  │  • WebSocket protocol           │
+│  • parakeet-tdt-0.6b-v3   │  │  • Routes to Claude             │
+│  • ~100-200ms latency     │  │  • Full context/memory          │
+│  • FREE (local)           │  │  • All tools available          │
+└───────────────────────────┘  └─────────────────────────────────┘
 ```
 
 ## Tech Stack
@@ -44,9 +45,56 @@ A minimal web app for voice conversations with Clawd (Claude). Speak into mic �
 |-------|--------|-----|
 | **Frontend** | Vanilla JS + HTML | No build step, ~250 lines |
 | **Voice Detection** | @ricky0123/vad-web | Best browser VAD, Silero model |
-| **Speech-to-Text** | OpenAI gpt-4o-transcribe | Fast, accurate, accepts WAV |
+| **Speech-to-Text** | Parakeet MLX (local) | Faster than Whisper, FREE, runs on Apple Silicon |
 | **LLM** | Claude via OpenClaw Gateway | Keeps existing context/memory |
 | **Text-to-Speech** | OpenAI gpt-4o-mini-tts | Natural voice, low latency |
+
+## Parakeet Server Setup
+
+Run on your Apple Silicon MacBook:
+
+```bash
+# Clone the repo
+git clone https://github.com/hostiefofostie/voice-chat.git
+cd voice-chat/parakeet-server
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Start server (preload model for faster first request)
+python server.py --preload
+
+# Server runs on http://0.0.0.0:8765
+```
+
+Get your MacBook's Tailscale IP:
+```bash
+tailscale ip -4
+# Example: 100.80.123.45
+```
+
+### Parakeet API
+
+**POST /transcribe**
+```bash
+curl -X POST http://<tailscale-ip>:8765/transcribe \
+  -F "audio=@recording.wav"
+```
+
+Response:
+```json
+{
+  "text": "Hello, this is a test.",
+  "segments": [
+    {"start": 0.0, "end": 1.5, "text": "Hello, this is a test."}
+  ]
+}
+```
+
+**GET /health**
+```bash
+curl http://<tailscale-ip>:8765/health
+```
 
 ## User Flow
 
@@ -161,25 +209,20 @@ function float32ToWav(samples, sampleRate = 16000) {
 }
 ```
 
-### 3. Whisper STT
+### 3. Parakeet STT (Local)
 
 ```javascript
 async function transcribe(wavBlob) {
   const formData = new FormData();
-  formData.append('file', wavBlob, 'audio.wav');
-  formData.append('model', 'gpt-4o-transcribe');
-  formData.append('language', 'en');
+  formData.append('audio', wavBlob, 'audio.wav');
   
-  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+  const response = await fetch(`${config.parakeetUrl}/transcribe`, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${config.openaiApiKey}`
-    },
     body: formData
   });
   
   if (!response.ok) {
-    throw new Error(`Whisper error: ${response.status}`);
+    throw new Error(`Parakeet error: ${response.status}`);
   }
   
   const data = await response.json();
@@ -454,7 +497,8 @@ On first load, prompt for config and store in localStorage:
 
 ```javascript
 const config = {
-  openaiApiKey: '',      // Required: sk-...
+  parakeetUrl: '',       // Required: http://<macbook-tailscale-ip>:8765
+  openaiApiKey: '',      // Required: sk-... (for TTS only)
   gatewayUrl: 'ws://localhost:18789/gateway',
   gatewayToken: '',      // Optional: if gateway auth enabled
   sessionKey: 'voice-chat:main',
@@ -505,10 +549,12 @@ function saveConfig() {
 | Step | Time |
 |------|------|
 | VAD detection | ~100ms |
-| Whisper transcription | ~500-800ms |
+| Parakeet transcription (local) | ~100-200ms |
 | Gateway + Claude | ~1-2s |
 | TTS generation | ~300-500ms |
-| **Total** | **~2-3.5s** |
+| **Total** | **~1.5-3s** |
+
+*Note: Parakeet is ~3-4x faster than Whisper API since there's no network roundtrip.*
 
 ---
 
@@ -516,10 +562,12 @@ function saveConfig() {
 
 | Service | Cost |
 |---------|------|
-| Whisper (gpt-4o-transcribe) | ~$0.03 |
+| Parakeet (local) | FREE |
 | Claude (via gateway) | varies |
 | TTS (gpt-4o-mini-tts) | ~$0.05 |
-| **Total** | **~$0.10-0.20** |
+| **Total** | **~$0.05-0.10** |
+
+*Parakeet saves ~$0.03/5min compared to Whisper API.*
 
 ---
 
