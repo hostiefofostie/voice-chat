@@ -497,7 +497,7 @@ On first load, prompt for config and store in localStorage:
 
 ```javascript
 const config = {
-  parakeetUrl: '',       // Required: http://<macbook-tailscale-ip>:8765
+  parakeetUrl: 'http://100.86.69.14:8765',  // Trevor's MacBook over Tailscale
   openaiApiKey: '',      // Required: sk-... (for TTS only)
   gatewayUrl: 'ws://localhost:18789/gateway',
   gatewayToken: '',      // Optional: if gateway auth enabled
