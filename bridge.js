@@ -3,6 +3,7 @@
    - POST /api/transcribe { audioBase64, mimeType }
    - POST /api/chat { text, sessionKey? }
    - POST /api/tts { text, voice? }
+   - POST /api/tts/stream { text, voice? }
    - GET  /api/health
 */
 
@@ -12,6 +13,7 @@ const crypto = require('crypto');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const { Readable } = require('stream');
 
 const PORT = Number(process.env.VOICE_BRIDGE_PORT || 8787);
 const PARKEET_URL = process.env.PARAKEET_URL || 'http://100.86.69.14:8765';
@@ -175,6 +177,23 @@ const extractTextFromMessage = (message) => {
   const role = message.role || message.authorRole || message.author?.role;
   if (role && role !== 'assistant') return '';
   return extractText(message.content ?? message.text ?? message.delta ?? message);
+};
+
+const mergeDeltaText = (buffer, next) => {
+  if (!next) return buffer || '';
+  if (!buffer) return next;
+  if (next === buffer) return buffer;
+  if (next.startsWith(buffer)) return next;
+  if (buffer.startsWith(next)) return buffer;
+  if (buffer.includes(next)) return buffer;
+  if (next.includes(buffer)) return next;
+  const maxOverlap = Math.min(buffer.length, next.length);
+  for (let i = maxOverlap; i > 0; i -= 1) {
+    if (buffer.slice(-i) === next.slice(0, i)) {
+      return buffer + next.slice(i);
+    }
+  }
+  return buffer + next;
 };
 
 class GatewayClient {
@@ -452,8 +471,7 @@ class GatewayClient {
 
     let pending = null;
     if (runId && this.pendingRuns.has(runId)) pending = this.pendingRuns.get(runId);
-    if (!pending && sessionKey && this.pendingSessions.has(sessionKey)) pending = this.pendingSessions.get(sessionKey);
-    if (!pending && this.pendingRuns.size === 1) pending = [...this.pendingRuns.values()][0];
+    if (!pending && !runId && sessionKey && this.pendingSessions.has(sessionKey)) pending = this.pendingSessions.get(sessionKey);
     if (!pending) return;
 
     if (isError) {
@@ -465,14 +483,29 @@ class GatewayClient {
     const text = extractTextFromMessage(payload.message || payload.delta || payload.content || payload);
     if (text) {
       if (isDelta) {
-        pending.buffer += text;
-      } else if (!pending.buffer || text.length > pending.buffer.length) {
-        pending.buffer = text;
+        if (text !== pending.lastDelta) {
+          const merged = mergeDeltaText(pending.buffer, text);
+          if (merged !== pending.buffer) {
+            pending.buffer = merged;
+            if (pending.onDelta) pending.onDelta(pending.buffer, payload);
+          }
+          pending.lastDelta = text;
+        }
+      } else {
+        const merged = mergeDeltaText(pending.buffer, text);
+        if (merged !== pending.buffer) {
+          pending.buffer = merged;
+          if (!isFinal && pending.onDelta) pending.onDelta(pending.buffer, payload);
+        }
       }
     }
 
     if (isFinal) {
       const finalText = pending.buffer.trim();
+      if (pending.onFinal && !pending.finalSent) {
+        pending.finalSent = true;
+        pending.onFinal(finalText, payload);
+      }
       this.resolvePending(pending, null, finalText);
     }
   }
@@ -501,7 +534,7 @@ class GatewayClient {
     });
   }
 
-  async sendChat(sessionKey, message) {
+  async sendChat(sessionKey, message, { onDelta, onFinal } = {}) {
     const payload = await this.sendRequest('chat.send', {
       sessionKey,
       message,
@@ -516,7 +549,11 @@ class GatewayClient {
         resolve,
         reject,
         timer: null,
-        buffer: ''
+        buffer: '',
+        lastDelta: '',
+        onDelta,
+        onFinal,
+        finalSent: false
       };
       pending.timer = setTimeout(() => {
         this.resolvePending(pending, new Error('Gateway chat timeout'));
@@ -554,7 +591,7 @@ const handleChat = async (req, res) => {
   const { text, sessionKey, mode } = await readJson(req);
   if (!text || !text.trim()) return json(res, 400, { error: 'text required' });
   const key = normalizeSessionKey(sessionKey || DEFAULT_SESSION_KEY);
-  const payload = mode === 'voice' ? `[[voice]] ${text}` : text;
+  const payload = mode === 'voice' ? `[[voice]] Be brief. ${text}` : text;
   try {
     const reply = await gateway.sendChat(key, payload);
     const t1 = Date.now();
@@ -564,6 +601,54 @@ const handleChat = async (req, res) => {
     const t1 = Date.now();
     console.log(`[chat] ${t1 - t0}ms error`);
     return json(res, 500, { error: 'Gateway chat error', detail: String(err?.message || err) });
+  }
+};
+
+const handleChatStream = async (req, res) => {
+  const t0 = Date.now();
+  const { text, sessionKey, mode } = await readJson(req);
+  if (!text || !text.trim()) return json(res, 400, { error: 'text required' });
+  const key = normalizeSessionKey(sessionKey || DEFAULT_SESSION_KEY);
+  const payload = mode === 'voice' ? `[[voice]] Be brief. ${text}` : text;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write('\n');
+
+  let closed = false;
+  req.on('close', () => { closed = true; });
+
+  const sendEvent = (event, data) => {
+    if (closed) return;
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  let finalSent = false;
+  try {
+    const reply = await gateway.sendChat(key, payload, {
+      onDelta: (delta) => {
+        if (!delta) return;
+        sendEvent('delta', { text: delta });
+      },
+      onFinal: (finalText) => {
+        finalSent = true;
+        sendEvent('final', { text: finalText || '' });
+      }
+    });
+    if (!finalSent) sendEvent('final', { text: reply || '' });
+    const t1 = Date.now();
+    console.log(`[chat-stream] ${t1 - t0}ms ok`);
+  } catch (err) {
+    const t1 = Date.now();
+    console.log(`[chat-stream] ${t1 - t0}ms error`);
+    sendEvent('error', { error: 'Gateway chat error', detail: String(err?.message || err) });
+  } finally {
+    if (!closed) res.end();
   }
 };
 
@@ -598,6 +683,62 @@ const handleTts = async (req, res) => {
   res.end(buf);
 };
 
+const handleTtsStream = async (req, res) => {
+  const t0 = Date.now();
+  const { text, voice, instructions } = await readJson(req);
+  if (!text || !text.trim()) return json(res, 400, { error: 'text required' });
+  if (!OPENAI_API_KEY) return json(res, 500, { error: 'OPENAI_API_KEY not set on bridge server' });
+
+  const resp = await fetch('https://api.openai.com/v1/audio/speech', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: TTS_MODEL,
+      voice: voice || TTS_VOICE,
+      input: text,
+      instructions,
+      response_format: 'mp3',
+      stream: true
+    })
+  });
+  const t1 = Date.now();
+  if (!resp.ok) {
+    const textErr = await resp.text().catch(() => '');
+    console.log(`[tts-stream] ${t1 - t0}ms error ${resp.status}`);
+    return json(res, resp.status, { error: `TTS error (${resp.status})`, detail: textErr });
+  }
+
+  console.log(`[tts-stream] ${t1 - t0}ms ok`);
+  res.writeHead(200, {
+    'Content-Type': 'audio/mpeg',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+
+  if (!resp.body) {
+    const buf = Buffer.from(await resp.arrayBuffer());
+    res.end(buf);
+    return;
+  }
+
+  try {
+    const stream = Readable.fromWeb(resp.body);
+    stream.on('data', (chunk) => res.write(chunk));
+    stream.on('end', () => res.end());
+    stream.on('error', (err) => {
+      console.log('[tts-stream] upstream error', err);
+      if (!res.writableEnded) res.end();
+    });
+  } catch (err) {
+    console.log('[tts-stream] stream error', err);
+    if (!res.writableEnded) res.end();
+  }
+};
+
 const handleHealth = async (_req, res) => {
   json(res, 200, {
     ok: true,
@@ -614,7 +755,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/health') return handleHealth(req, res);
     if (req.method === 'POST' && url.pathname === '/api/transcribe') return await handleTranscribe(req, res);
     if (req.method === 'POST' && url.pathname === '/api/chat') return await handleChat(req, res);
+    if (req.method === 'POST' && url.pathname === '/api/chat/stream') return await handleChatStream(req, res);
     if (req.method === 'POST' && url.pathname === '/api/tts') return await handleTts(req, res);
+    if (req.method === 'POST' && url.pathname === '/api/tts/stream') return await handleTtsStream(req, res);
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
   } catch (err) {

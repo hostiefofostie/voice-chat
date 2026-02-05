@@ -42,7 +42,7 @@
       <button id="speechToggle" class="secondary">Speech: On</button>
       <button id="configBtn" class="secondary">Config</button>
     </div>
-    <audio id="replyAudio" controls style="display:none;width:100%;margin:6px 0 0"></audio>
+    <!-- replyAudio removed -->
     <div id="hint">Mic permission required. Bridge server handles STT/LLM/TTS. <span id="build"></span></div>
   </div>
 
@@ -63,7 +63,7 @@
   <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"></script>
   <script>
     (() => {
-      const BUILD = '2026-02-03-1208';
+      const BUILD = '2026-02-04-0919';
       const $ = id => document.getElementById(id),
         statusText = $('status-text'),
         indicator = $('indicator'),
@@ -75,7 +75,7 @@
         muteBtn = $('muteBtn'),
         unlockBtn = $('unlockBtn'),
         speechToggle = $('speechToggle'),
-        replyAudioEl = $('replyAudio'),
+        // replyAudioEl removed
         configBtn = $('configBtn'),
         configDialog = $('configDialog'),
         configForm = $('configForm'),
@@ -86,11 +86,35 @@
       if (buildEl) buildEl.textContent = `build ${BUILD}`;
 
       const DEFAULT_TTS_INSTRUCTIONS = "Voice Affect: Calm, composed, and reassuring; project quiet authority and confidence.\n\nTone: Sincere, empathetic, and gently authoritative—express genuine apology while conveying competence.\n\nPacing: Steady and moderate; unhurried enough to communicate care, yet efficient enough to demonstrate professionalism.\n\nEmotion: Genuine empathy and understanding; speak with warmth, especially during apologies (\"I'm very sorry for any disruption...\").\n\nPronunciation: Clear and precise, emphasizing key reassurances (\"smoothly,\" \"quickly,\" \"promptly\") to reinforce confidence.\n\nPauses: Brief pauses after offering assistance or requesting details, highlighting willingness to listen and support.";
+      const SAMPLE_RATE = 16000;
+      // Base silence used for endpointing; adaptive logic stretches it for longer turns.
+      const ENDPOINT_SILENCE_MS = 650;
+      const ENDPOINT_MIN_SILENCE_MS = 450;
+      const ENDPOINT_MAX_SILENCE_MS = 1600;
+      const ENDPOINT_JOIN_SILENCE_MS = 120;
+      const BARGE_IN_HOLDOFF_MS = 700;
+      const BARGE_IN_CONFIRM_MS = 400;
+      const BARGE_IN_MIN_MS = 350;
+      const STREAM_TTS_ON_DELTA = true;
+      const TTS_CHUNK_MIN_CHARS = 18;
       const config = { sessionKey:'main', voice:'cedar', instructions: DEFAULT_TTS_INSTRUCTIONS };
-      let status='stopped', running=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, speechEnabled=true, isRecording=false, isMuted=false;
+      let status='stopped', running=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, isTtsFetching=false, speechEnabled=true, isRecording=false, isMuted=false, lastAudioUrl=null, autoplayPrimed=false, autoplayPrimeAudio=null;
       const audioQueue = [];
-      let pendingReplyText = '';
-      let skippedReplyCount = 0;
+      const ttsQueue = [];
+      let ttsStreamState = null;
+      let pendingSpeech = null;
+      let pendingSpeechMeta = null;
+      let endpointTimer = null;
+      let adaptiveEndpointMs = ENDPOINT_SILENCE_MS;
+      let lastTurnEndAt = 0;
+      let lastTurnGapMs = null;
+      let turnSeq = 0;
+      let activeTurnId = 0;
+      let currentTtsAbort = null;
+      let currentTtsRequestId = 0;
+      let lastTtsStartAt = 0;
+      let bargeInTimer = null;
+      let bargeInStartAt = 0;
       const statusMap = { listening:['🟢','Listening...'], recording:['🔴','Recording...'], processing:['🟡','Processing...'], thinking:['🟣','Thinking...'], speaking:['🔵','Speaking...'], error:['⚫','Error'], stopped:['⏹️','Stopped'] };
 
       const setStatus = (state, detail) => {
@@ -102,17 +126,161 @@
         statusText.textContent = detail || (isMuted && !['speaking','error','stopped'].includes(state) ? 'Muted' : text);
       };
 
+      const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+      const computeEndpointMs = (speechMs=0) => {
+        const base = ENDPOINT_SILENCE_MS;
+        const speechBoost = Math.min(400, Math.round(speechMs * 0.15));
+        const adaptive = adaptiveEndpointMs || base;
+        return clamp(Math.max(base + speechBoost, adaptive), ENDPOINT_MIN_SILENCE_MS, ENDPOINT_MAX_SILENCE_MS);
+      };
+      const updateAdaptiveEndpoint = (transcript) => {
+        const words = transcript.trim().split(/\s+/).filter(Boolean).length;
+        if (!words) return;
+        const extra = Math.min(600, words * 40);
+        adaptiveEndpointMs = clamp(ENDPOINT_SILENCE_MS + extra, ENDPOINT_MIN_SILENCE_MS, ENDPOINT_MAX_SILENCE_MS);
+      };
+      const mergeAudioChunks = (chunks) => {
+        if (!chunks || chunks.length === 0) return new Float32Array();
+        if (chunks.length === 1) return chunks[0];
+        const gapSamples = Math.max(0, Math.floor(SAMPLE_RATE * (ENDPOINT_JOIN_SILENCE_MS / 1000)));
+        const total = chunks.reduce((sum, chunk, idx) => sum + chunk.length + (idx ? gapSamples : 0), 0);
+        const merged = new Float32Array(total);
+        let offset = 0;
+        chunks.forEach((chunk, idx) => {
+          if (idx) offset += gapSamples;
+          merged.set(chunk, offset);
+          offset += chunk.length;
+        });
+        return merged;
+      };
+      const clearPendingReplies = (reason) => {
+        if (ttsQueue.length) {
+          console.log(`[queue] drop ${ttsQueue.length} pending tts${reason ? ` (${reason})` : ''}`);
+        }
+        ttsQueue.length = 0;
+        ttsStreamState = null;
+      };
+      const abortTtsFetch = (reason) => {
+        if (!currentTtsAbort) return;
+        try { currentTtsAbort.abort(); } catch {}
+        currentTtsAbort = null;
+        isTtsFetching = false;
+        currentTtsRequestId += 1;
+        if (reason) console.log(`[tts] abort${reason ? ` (${reason})` : ''}`);
+      };
+      const stopTtsPlayback = (reason) => {
+        if (currentSource) {
+          currentSource.onended = null;
+          try { currentSource.stop(); } catch {}
+          currentSource = null;
+        }
+        if (currentAudio) {
+          try { currentAudio.pause(); } catch {}
+          currentAudio.src = '';
+          currentAudio = null;
+        }
+        if (isSpeaking) isSpeaking = false;
+        if (reason) console.log(`[tts] stop${reason ? ` (${reason})` : ''}`);
+      };
+      const beginUserTurn = (source, { bargeIn=false } = {}) => {
+        if (bargeIn) {
+          stopTtsPlayback('barge-in');
+          abortTtsFetch('barge-in');
+        }
+        clearPendingReplies(`new ${source} input`);
+        const id = ++turnSeq;
+        activeTurnId = id;
+        return id;
+      };
+      const logTurnTiming = (timing, { ttsSkipped=false, ttsAborted=false } = {}) => {
+        if (!timing || timing.logged) return;
+        if (!timing.vadEndAt || !timing.transcribeEndAt || !timing.chatEndAt) return;
+        const vadToTranscribe = timing.transcribeEndAt - timing.vadEndAt;
+        const transcribeToChat = timing.chatEndAt - timing.transcribeEndAt;
+        const ttsEndAt = timing.ttsEndAt;
+        const chatToTts = ttsEndAt ? ttsEndAt - timing.chatEndAt : null;
+        const total = (ttsEndAt || timing.chatEndAt) - timing.vadEndAt;
+        const gapLabel = timing.gapMs != null ? `${Math.round(timing.gapMs)}ms` : 'n/a';
+        const ttsLabel = ttsSkipped ? 'skipped' : ttsAborted ? 'aborted' : (chatToTts != null ? `${Math.round(chatToTts)}ms` : 'pending');
+        console.log(`[timing] turn ${timing.turnId || '?'} gap ${gapLabel} vad->transcribe ${Math.round(vadToTranscribe)}ms transcribe->chat ${Math.round(transcribeToChat)}ms chat->tts ${ttsLabel} total ${Math.round(total)}ms`);
+        timing.logged = true;
+      };
+
       const tryPlayTts = async () => {
-        if (!speechEnabled || !audioUnlocked) return;
-        if (isSpeaking || isRecording || busy) return;
-        if (!pendingReplyText) return;
-        const catchup = skippedReplyCount > 0
-          ? 'Quick catch-up: I sent earlier details in chat. Latest reply: '
-          : '';
-        const toSpeak = catchup + pendingReplyText;
-        pendingReplyText = '';
-        skippedReplyCount = 0;
-        await speak(toSpeak);
+        if (!speechEnabled) return;
+        try { await ensureAudioContext(); } catch {}
+        audioUnlocked = audioCtx?.state === 'running';
+        if (!audioUnlocked) {
+          if (unlockBtn) unlockBtn.style.display = 'inline-block';
+          return;
+        }
+        if (isSpeaking || isTtsFetching || isRecording) return;
+        if (!ttsQueue.length) return;
+        const next = ttsQueue.shift();
+        await speak(next.text, next.timing || null);
+      };
+      const queueReply = (text, timing) => {
+        if (!text) return;
+        ttsQueue.push({ text, timing: timing || null });
+      };
+      const appendDeltaText = (prev, next) => {
+        if (!next) return '';
+        if (!prev) return next;
+        if (next.startsWith(prev)) return next.slice(prev.length);
+        if (prev.startsWith(next)) return '';
+        const max = Math.min(prev.length, next.length);
+        let i = 0;
+        while (i < max && prev[i] === next[i]) i += 1;
+        if (i === 0) return next;
+        return next.slice(i);
+      };
+      const splitTtsChunks = (text, final=false) => {
+        const chunks = [];
+        let start = 0;
+        for (let i = 0; i < text.length; i += 1) {
+          const ch = text[i];
+          if (ch === '.' || ch === '!' || ch === '?' || ch === '\n') {
+            let end = i + 1;
+            while (end < text.length && /\s/.test(text[end])) end += 1;
+            chunks.push(text.slice(start, end));
+            start = end;
+            i = end - 1;
+          }
+        }
+        let remaining = text.slice(start);
+        if (!final && chunks.length) {
+          const last = chunks[chunks.length - 1];
+          if (last.trim().length < TTS_CHUNK_MIN_CHARS) {
+            remaining = last + remaining;
+            chunks.pop();
+          }
+        }
+        if (final && remaining.trim()) {
+          chunks.push(remaining);
+          remaining = '';
+        }
+        return { chunks, remaining };
+      };
+      const startTtsStream = (turnId, timing) => {
+        ttsStreamState = { turnId, buffer: '', lastText: '', timing, timingUsed: false };
+      };
+      const handleTtsDelta = (text, timing, { final=false } = {}) => {
+        if (!speechEnabled) return;
+        if (!ttsStreamState || ttsStreamState.turnId !== activeTurnId) return;
+        const appended = appendDeltaText(ttsStreamState.lastText, text || '');
+        if (text !== undefined) ttsStreamState.lastText = text || ttsStreamState.lastText;
+        if (appended) ttsStreamState.buffer += appended;
+        const { chunks, remaining } = splitTtsChunks(ttsStreamState.buffer, final);
+        ttsStreamState.buffer = remaining;
+        chunks.forEach((chunk) => {
+          const trimmed = chunk.trim();
+          if (!trimmed) return;
+          const useTiming = (!ttsStreamState.timingUsed && timing) ? timing : null;
+          if (useTiming) ttsStreamState.timingUsed = true;
+          queueReply(trimmed, useTiming);
+        });
+        if (final) ttsStreamState = null;
+        if (chunks.length) tryPlayTts();
       };
       const addMessage = (role, text) => {
         const div = document.createElement('div');
@@ -172,25 +340,40 @@
         if (!msg) return;
         const ok = await ensureConfig();
         if (!ok) return;
+        const turnId = beginUserTurn('text');
         addMessage('user', msg);
         if (textInput) textInput.value = '';
         try {
           setStatus('thinking');
-          const reply = await sendMessage(msg);
+          const useDeltaTts = STREAM_TTS_ON_DELTA && speechEnabled;
+          if (useDeltaTts) startTtsStream(turnId, null);
+          const reply = await sendMessage(msg, {
+            onDelta: (partial) => {
+              if (partial) updateAssistant(partial);
+              if (useDeltaTts) handleTtsDelta(partial, null);
+            },
+            onFinal: (finalText) => {
+              if (useDeltaTts) handleTtsDelta(finalText, null, { final: true });
+            }
+          });
           if (reply) {
             updateAssistant(reply);
             lastReplyText = reply;
-            if (speechEnabled) {
+            const superseded = turnId !== activeTurnId;
+            if (!superseded && speechEnabled) {
               if (audioUnlocked) {
-                if (pendingReplyText) skippedReplyCount += 1;
-                pendingReplyText = reply;
-                await tryPlayTts();
+                if (!useDeltaTts) {
+                  queueReply(reply, null);
+                  await tryPlayTts();
+                } else if (ttsStreamState && ttsStreamState.turnId === turnId) {
+                  handleTtsDelta(reply, null, { final: true });
+                }
               } else {
                 setStatus('listening', 'Tap Start to enable audio');
               }
-            } else if (running) {
+            } else if (!superseded && running) {
               setStatus('listening');
-            } else {
+            } else if (!superseded) {
               setStatus('stopped');
             }
           }
@@ -201,7 +384,7 @@
         }
       };
 
-      const float32ToWav = (samples, sampleRate=16000) => {
+      const float32ToWav = (samples, sampleRate=SAMPLE_RATE) => {
         const buffer = new ArrayBuffer(44 + samples.length * 2);
         const view = new DataView(buffer);
         const writeStr = (offset, str) => { for (let i=0; i<str.length; i++) view.setUint8(offset+i, str.charCodeAt(i)); };
@@ -241,8 +424,8 @@
         return data.text || '';
       };
 
-      const sendMessage = async (text) => {
-        const response = await fetch('/api/chat', {
+      const sendMessage = async (text, { onDelta, onFinal } = {}) => {
+        const response = await fetch('/api/chat/stream', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ text, sessionKey: config.sessionKey, mode: 'voice' })
@@ -251,13 +434,59 @@
           const body = await response.text().catch(() => '');
           throw new Error(`Chat error ${response.status}: ${body || 'no body'}`);
         }
-        let data;
-        try {
-          data = await response.json();
-        } catch (err) {
-          throw new Error(`Chat parse error: ${String(err)}`);
+        if (!response.body) return '';
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let eventName = 'message';
+        let dataLines = [];
+        let lastText = '';
+        let finalText = '';
+        const flushEvent = () => {
+          if (!dataLines.length) return;
+          const dataStr = dataLines.join('\n');
+          let payload = null;
+          try {
+            payload = JSON.parse(dataStr);
+          } catch {
+            payload = { text: dataStr };
+          }
+          const text = payload?.text ?? '';
+          if (eventName === 'delta') {
+            if (text) lastText = text;
+            if (onDelta) onDelta(text, payload);
+          } else if (eventName === 'final') {
+            finalText = text || lastText;
+            if (onFinal) onFinal(finalText, payload);
+          } else if (eventName === 'error') {
+            const message = payload?.error || payload?.message || dataStr || 'Chat stream error';
+            throw new Error(message);
+          }
+          dataLines = [];
+          eventName = 'message';
+        };
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buffer.indexOf('\n')) !== -1) {
+            let line = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 1);
+            if (line.endsWith('\r')) line = line.slice(0, -1);
+            if (!line) {
+              flushEvent();
+              continue;
+            }
+            if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              dataLines.push(line.slice(5).trimStart());
+            }
+          }
         }
-        return data.text || '';
+        flushEvent();
+        return finalText || lastText || '';
       };
 
       const ensureAudioContext = async () => {
@@ -265,6 +494,22 @@
         if (audioCtx.state === 'suspended') await audioCtx.resume();
         window.audioCtx = audioCtx;
       };
+      const primeAutoplay = async () => {
+        if (autoplayPrimed) return;
+        autoplayPrimed = true;
+        try {
+          const a = new Audio();
+          autoplayPrimeAudio = a;
+          a.muted = true;
+          a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
+          await a.play();
+          a.pause();
+          a.muted = false;
+        } catch (err) {
+          console.warn('Autoplay prime failed', err);
+        }
+      };
+
       const unlockAudio = async () => {
         await ensureAudioContext();
         const buffer = audioCtx.createBuffer(1, 1, 22050);
@@ -273,6 +518,20 @@
         source.connect(audioCtx.destination);
         source.start(0);
         audioUnlocked = true;
+        await primeAutoplay();
+      };
+
+      const requestMicPermission = async () => {
+        if (!navigator.mediaDevices?.getUserMedia) return false;
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach(track => track.stop());
+          return true;
+        } catch (err) {
+          console.warn('Mic permission failed', err);
+          setStatus('error', 'Mic permission blocked');
+          return false;
+        }
       };
 
       const padBuffer = (buffer, preMs=80, postMs=120) => {
@@ -285,70 +544,311 @@
         return padded;
       };
 
-      const speak = async (text) => {
+      const canStreamTts = () => {
+        if (!window.MediaSource || typeof MediaSource.isTypeSupported !== 'function') return false;
+        const mime = 'audio/mpeg';
+        const audioOk = !!document.createElement('audio').canPlayType(mime);
+        if (!audioOk) return false;
+        if (!MediaSource.isTypeSupported(mime)) return false;
+        const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent || '');
+        if (isSafari) return false;
+        return true;
+      };
+
+      const streamTtsPlayback = async (text, timing, requestId, controller) => {
+        const payload = { text, voice: config.voice };
+        if (config.instructions) payload.instructions = config.instructions;
+        const response = await fetch('/api/tts/stream', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+        if (!response.ok || !response.body) {
+          const body = await response.text().catch(() => '');
+          throw new Error(`TTS stream error ${response.status}: ${body || 'no body'}`);
+        }
+
+        const mediaSource = new MediaSource();
+        const audio = new Audio();
+        currentAudio = audio;
+        let objectUrl = '';
+        try { if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl); } catch {}
+        objectUrl = URL.createObjectURL(mediaSource);
+        lastAudioUrl = objectUrl;
+        audio.src = objectUrl;
+        // replyAudio element removed
+
+        let sourceBuffer = null;
+        let queue = [];
+        let streamDone = false;
+        let appending = false;
+        let firstChunkLogged = false;
+
+        const pump = () => {
+          if (!sourceBuffer || appending) return;
+          if (queue.length === 0) {
+            if (streamDone && !sourceBuffer.updating && mediaSource.readyState === 'open') {
+              try { mediaSource.endOfStream(); } catch {}
+            }
+            return;
+          }
+          appending = true;
+          try {
+            sourceBuffer.appendBuffer(queue.shift());
+          } catch (err) {
+            appending = false;
+            throw err;
+          }
+        };
+
+        mediaSource.addEventListener('sourceopen', () => {
+          if (mediaSource.readyState !== 'open') return;
+          sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+          sourceBuffer.mode = 'sequence';
+          sourceBuffer.addEventListener('updateend', () => {
+            appending = false;
+            pump();
+          });
+          pump();
+        }, { once: true });
+
+        isSpeaking = true;
+        const cleanup = (reason) => {
+          if (currentAudio === audio) {
+            try { audio.pause(); } catch {}
+            currentAudio = null;
+          }
+          isSpeaking = false;
+          if (mediaSource?.readyState === 'open') {
+            try { mediaSource.endOfStream(); } catch {}
+          }
+          if (reason) console.log(`[tts] stream cleanup${reason ? ` (${reason})` : ''}`);
+        };
+
+        audio.onended = () => {
+          cleanup();
+          if (running) setStatus('listening');
+          tryPlayTts();
+        };
+        let streamError = null;
+        audio.onerror = () => {
+          streamError = new Error('Audio element error');
+          cleanup('audio-error');
+        };
+
+        let playbackStarted = false;
+        const startPlayback = async () => {
+          if (playbackStarted) return;
+          playbackStarted = true;
+          try { await audio.play(); }
+          catch (err) {
+            cleanup('play-error');
+            throw err;
+          }
+        };
+
+        try {
+          const reader = response.body.getReader();
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (currentTtsRequestId !== requestId) {
+              try { await reader.cancel(); } catch {}
+              cleanup('superseded');
+              break;
+            }
+            if (streamError) throw streamError;
+            if (!value || value.length === 0) continue;
+            if (!firstChunkLogged) {
+              firstChunkLogged = true;
+              if (timing) {
+                timing.ttsEndAt = Date.now();
+                logTurnTiming(timing);
+              }
+              await startPlayback();
+            }
+            queue.push(value);
+            pump();
+          }
+          streamDone = true;
+          pump();
+        } catch (err) {
+          cleanup('stream-failed');
+          throw err;
+        } finally {
+          if (currentTtsRequestId === requestId) {
+            isTtsFetching = false;
+            currentTtsAbort = null;
+          }
+        }
+      };
+
+      const speak = async (text, timing) => {
         if (!text) return;
         setStatus('speaking');
+        lastTtsStartAt = Date.now();
+        const requestId = ++currentTtsRequestId;
+        const controller = new AbortController();
+        currentTtsAbort = controller;
+        isTtsFetching = true;
+        if (timing) timing.ttsStartAt = Date.now();
         try {
           await ensureAudioContext();
+          audioUnlocked = audioCtx?.state === 'running';
+          if (!audioUnlocked && unlockBtn) unlockBtn.style.display = 'inline-block';
+
+          if (canStreamTts()) {
+            try {
+              await streamTtsPlayback(text, timing, requestId, controller);
+              return;
+            } catch (err) {
+              console.warn('TTS stream failed, falling back', err);
+              if (currentTtsRequestId !== requestId) return;
+            }
+          }
+
           const payload = { text, voice: config.voice };
           if (config.instructions) payload.instructions = config.instructions;
           const response = await fetch('/api/tts', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: controller.signal
           });
           if (!response.ok) {
             const body = await response.text().catch(() => '');
             throw new Error(`TTS error ${response.status}: ${body || 'no body'}`);
           }
           const arrayBuffer = await response.arrayBuffer();
-          const buffer = await audioCtx.decodeAudioData(arrayBuffer);
-          const padded = padBuffer(buffer);
-          if (currentSource) { try { currentSource.stop(); } catch {} }
-          const source = audioCtx.createBufferSource();
-          currentSource = source;
-          isSpeaking = true;
-          source.buffer = padded;
-          source.connect(audioCtx.destination);
-          source.onended = () => {
-            isSpeaking = false;
-            currentSource = null;
-            if (running) setStatus('listening');
-            tryPlayTts();
-          };
-          source.start(0);
+          if (currentTtsRequestId !== requestId) return;
+          try { if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl); } catch {}
+          const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+          const url = URL.createObjectURL(blob);
+          lastAudioUrl = url;
+          // replyAudio element removed
+          let buffer = null;
+          try {
+            buffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+          } catch (decodeErr) {
+            console.warn('Audio decode failed, falling back to HTMLAudio', decodeErr);
+          }
+          if (currentTtsRequestId !== requestId) return;
+          if (timing) {
+            timing.ttsEndAt = Date.now();
+            logTurnTiming(timing);
+          }
+          if (buffer) {
+            const padded = padBuffer(buffer);
+            if (currentSource) { try { currentSource.stop(); } catch {} }
+            const source = audioCtx.createBufferSource();
+            currentSource = source;
+            isSpeaking = true;
+            isTtsFetching = false;
+            currentTtsAbort = null;
+            source.buffer = padded;
+            source.connect(audioCtx.destination);
+            source.onended = () => {
+              isSpeaking = false;
+              currentSource = null;
+              if (running) setStatus('listening');
+              tryPlayTts();
+            };
+            source.start(0);
+          } else {
+            const url = lastAudioUrl;
+            const audio = new Audio(url);
+            currentAudio = audio;
+            isSpeaking = true;
+            isTtsFetching = false;
+            currentTtsAbort = null;
+            audio.onended = () => {
+              isSpeaking = false;
+              currentAudio = null;
+              if (running) setStatus('listening');
+              tryPlayTts();
+            };
+            await audio.play();
+          }
         } catch (err) {
+          if (err?.name === 'AbortError') {
+            stopTtsPlayback('abort');
+            if (timing) {
+              timing.ttsEndAt = Date.now();
+              logTurnTiming(timing, { ttsAborted: true });
+            }
+            return;
+          }
           console.error('TTS playback failed', err);
           isSpeaking = false;
           currentSource = null;
+          isTtsFetching = false;
+          currentTtsAbort = null;
+          if (timing) {
+            timing.ttsEndAt = Date.now();
+            logTurnTiming(timing, { ttsSkipped: true });
+          }
+          if (unlockBtn) unlockBtn.style.display = 'inline-block';
           setStatus('error', `Audio error: ${err?.message || String(err)}`);
           tryPlayTts();
+        } finally {
+          if (currentTtsRequestId === requestId) {
+            isTtsFetching = false;
+            currentTtsAbort = null;
+          }
         }
       };
 
-      const processAudio = async (audioSamples) => {
+      const processAudio = async (payload) => {
+        const audioSamples = payload?.audio || payload;
+        const timing = payload?.timing || { turnId: activeTurnId, vadEndAt: Date.now(), gapMs: lastTurnGapMs };
         try {
           const wavBlob = float32ToWav(audioSamples);
+          timing.transcribeStartAt = Date.now();
           const transcript = (await transcribe(wavBlob)).trim();
+          timing.transcribeEndAt = Date.now();
           if (!transcript) return;
+          updateAdaptiveEndpoint(transcript);
           addMessage('user', transcript);
           setStatus('thinking');
-          const reply = await sendMessage(transcript);
+          timing.chatStartAt = Date.now();
+          const useDeltaTts = STREAM_TTS_ON_DELTA && speechEnabled;
+          if (useDeltaTts) startTtsStream(timing.turnId || activeTurnId, timing);
+          const reply = await sendMessage(transcript, {
+            onDelta: (partial) => {
+              if (partial) updateAssistant(partial);
+              if (useDeltaTts) handleTtsDelta(partial, timing);
+            },
+            onFinal: (finalText) => {
+              if (useDeltaTts) handleTtsDelta(finalText, timing, { final: true });
+            }
+          });
+          timing.chatEndAt = Date.now();
           if (reply) {
             updateAssistant(reply);
             lastReplyText = reply;
-            if (speechEnabled) {
+            const superseded = timing.turnId && timing.turnId !== activeTurnId;
+            if (!superseded && speechEnabled) {
               if (audioUnlocked) {
-                if (pendingReplyText) skippedReplyCount += 1;
-                pendingReplyText = reply;
-                await tryPlayTts();
+                if (!useDeltaTts) {
+                  queueReply(reply, timing);
+                  await tryPlayTts();
+                } else if (ttsStreamState && ttsStreamState.turnId === (timing.turnId || activeTurnId)) {
+                  handleTtsDelta(reply, timing, { final: true });
+                }
               } else {
                 setStatus('listening', 'Tap Start to enable audio');
+                logTurnTiming(timing, { ttsSkipped: true });
               }
-            } else if (running) {
+            } else if (!superseded && running) {
               setStatus('listening');
-            } else {
+              logTurnTiming(timing, { ttsSkipped: true });
+            } else if (!superseded) {
               setStatus('stopped');
+              logTurnTiming(timing, { ttsSkipped: true });
+            } else {
+              console.log(`[queue] drop reply for turn ${timing.turnId} (superseded by ${activeTurnId})`);
+              logTurnTiming(timing, { ttsSkipped: true });
             }
           }
           currentAssistantEl = null;
@@ -370,22 +870,87 @@
         tryPlayTts();
       };
 
+      // Endpointing: delay commit so short pauses can be merged into one turn.
+      const finalizePendingSpeech = () => {
+        if (!pendingSpeech) return;
+        const merged = mergeAudioChunks(pendingSpeech.chunks);
+        const timing = {
+          turnId: pendingSpeech.turnId || activeTurnId,
+          gapMs: pendingSpeech.gapMs ?? null,
+          speechMs: pendingSpeech.speechMs || 0,
+          vadEndAt: Date.now()
+        };
+        pendingSpeech = null;
+        pendingSpeechMeta = null;
+        lastTurnEndAt = timing.vadEndAt;
+        audioQueue.push({ audio: merged, timing });
+        processNextAudio();
+      };
+      const scheduleEndpointCommit = () => {
+        if (!pendingSpeech) return;
+        if (endpointTimer) clearTimeout(endpointTimer);
+        const silenceMs = computeEndpointMs(pendingSpeech.speechMs || 0);
+        endpointTimer = setTimeout(() => {
+          endpointTimer = null;
+          if (!running) return;
+          finalizePendingSpeech();
+        }, silenceMs);
+      };
+
       const startVAD = async () => {
         vadInstance = await vad.MicVAD.new({
-          positiveSpeechThreshold: 0.7,
-          minSpeechFrames: 6,
+          positiveSpeechThreshold: 0.85,
+          minSpeechFrames: 12,
           preSpeechPadFrames: 2,
           onSpeechStart: () => {
+            const now = Date.now();
             if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-            if (isSpeaking && currentSource) { try { currentSource.stop(); } catch {} isSpeaking = false; currentSource = null; }
+            if (isSpeaking || isTtsFetching) {
+              const inHoldoff = lastTtsStartAt && (now - lastTtsStartAt < BARGE_IN_HOLDOFF_MS);
+              if (inHoldoff) {
+                console.log('[vad] ignore barge-in (holdoff)');
+                return;
+              }
+              bargeInStartAt = now;
+              if (bargeInTimer) clearTimeout(bargeInTimer);
+              bargeInTimer = setTimeout(() => {
+                bargeInTimer = null;
+                const elapsed = Date.now() - bargeInStartAt;
+                if ((isSpeaking || isTtsFetching) && isRecording && elapsed >= BARGE_IN_MIN_MS) {
+                  stopTtsPlayback('barge-in');
+                  abortTtsFetch('barge-in');
+                  clearPendingReplies('barge-in');
+                } else {
+                  console.log('[vad] ignore barge-in (short)');
+                }
+              }, BARGE_IN_CONFIRM_MS);
+            }
+            if (!pendingSpeech) {
+              lastTurnGapMs = lastTurnEndAt ? now - lastTurnEndAt : null;
+              if (lastTurnGapMs != null) console.log(`[turn] gap ${Math.round(lastTurnGapMs)}ms`);
+              const turnId = beginUserTurn('speech');
+              pendingSpeechMeta = { turnId, gapMs: lastTurnGapMs };
+            }
+            if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
             isRecording = true;
             setStatus('recording');
           },
           onSpeechEnd: async (audio) => {
             if (!running) return;
             isRecording = false;
-            audioQueue.push(audio);
-            processNextAudio();
+            if (bargeInTimer) { clearTimeout(bargeInTimer); bargeInTimer = null; }
+            if (!pendingSpeech) {
+              pendingSpeech = {
+                chunks: [],
+                speechMs: 0,
+                turnId: pendingSpeechMeta?.turnId || activeTurnId,
+                gapMs: pendingSpeechMeta?.gapMs ?? null
+              };
+              pendingSpeechMeta = null;
+            }
+            pendingSpeech.chunks.push(audio);
+            pendingSpeech.speechMs += (audio.length / SAMPLE_RATE) * 1000;
+            scheduleEndpointCommit();
           },
           onnxWASMBasePath:'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
           baseAssetPath:'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/'
@@ -397,13 +962,15 @@
         if (running) return;
         const ok = await ensureConfig();
         if (!ok) return;
-        running = true; startBtn.disabled = true; stopBtn.disabled = false;
-        try {
-          await unlockAudio();
-        } catch (err) {
+        const micPromise = requestMicPermission();
+        const unlockPromise = unlockAudio().catch((err) => {
           console.error('Audio unlock failed', err);
           if (unlockBtn) unlockBtn.style.display = 'inline-block';
-        }
+        });
+        const micOk = await micPromise;
+        if (!micOk) return;
+        await unlockPromise;
+        running = true; startBtn.disabled = true; stopBtn.disabled = false;
         await startVAD();
         if (isMuted && vadInstance) vadInstance.pause();
         setStatus(isMuted ? 'stopped' : 'listening', isMuted ? 'Muted' : undefined);
@@ -412,10 +979,17 @@
         running = false;
         if (vadInstance) { vadInstance.pause(); vadInstance = null; }
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
+        if (bargeInTimer) { clearTimeout(bargeInTimer); bargeInTimer = null; }
+        pendingSpeech = null;
+        pendingSpeechMeta = null;
+        stopTtsPlayback('stop');
+        abortTtsFetch('stop');
         audioQueue.length = 0;
-        pendingReplyText = '';
-        skippedReplyCount = 0;
+        clearPendingReplies('stop');
         isRecording = false;
+        lastTurnEndAt = 0;
+        lastTurnGapMs = null;
         setStatus('stopped'); startBtn.disabled = false; stopBtn.disabled = true;
       };
 
@@ -423,13 +997,13 @@
       stopBtn.addEventListener('click', stop);
       if (sendBtn && textInput) {
         sendBtn.addEventListener('click', async () => {
-          try { await ensureAudioContext(); audioUnlocked = true; } catch {}
+          try { await unlockAudio(); } catch {}
           await sendText(textInput.value);
         });
         textInput.addEventListener('keydown', async (e) => {
           if (e.key === 'Enter') {
             e.preventDefault();
-            try { await ensureAudioContext(); audioUnlocked = true; } catch {}
+            try { await unlockAudio(); } catch {}
             await sendText(textInput.value);
           }
         });
