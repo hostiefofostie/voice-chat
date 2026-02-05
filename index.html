@@ -103,7 +103,7 @@
       const STREAM_TTS_ON_DELTA = false;
       const TTS_CHUNK_MIN_CHARS = 18;
       const config = { sessionKey:'main', voice:'cedar', instructions: DEFAULT_TTS_INSTRUCTIONS };
-      let status='stopped', running=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, isTtsFetching=false, speechEnabled=true, isRecording=false, isMuted=false, autoEndpointing=true, lastAudioUrl=null, autoplayPrimed=false, autoplayPrimeAudio=null;
+      let status='stopped', running=false, starting=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, isTtsFetching=false, speechEnabled=true, isRecording=false, isMuted=false, autoEndpointing=true, lastAudioUrl=null, autoplayPrimed=false, autoplayPrimeAudio=null;
       const audioQueue = [];
       const ttsQueue = [];
       let ttsStreamState = null;
@@ -892,7 +892,7 @@
       const finalizePendingSpeech = () => {
         if (!pendingSpeech) return;
         const turnId = pendingSpeech.turnId || activeTurnId;
-        if (turnId && turnId === lastCommittedTurnId) {
+        if (turnId === lastCommittedTurnId) {
           console.log(`[endpoint] skip duplicate commit for turn ${turnId}`);
           pendingSpeech = null;
           pendingSpeechMeta = null;
@@ -936,6 +936,7 @@
       };
 
       const startVAD = async () => {
+        if (vadInstance) return;
         vadInstance = await vad.MicVAD.new({
           positiveSpeechThreshold: 0.85,
           minSpeechFrames: 12,
@@ -1002,24 +1003,41 @@
       };
 
       const start = async () => {
-        if (running) return;
-        const ok = await ensureConfig();
-        if (!ok) return;
-        const micPromise = requestMicPermission();
-        const unlockPromise = unlockAudio().catch((err) => {
-          console.error('Audio unlock failed', err);
-          if (unlockBtn) unlockBtn.style.display = 'inline-block';
-        });
-        const micOk = await micPromise;
-        if (!micOk) return;
-        await unlockPromise;
-        running = true; startBtn.disabled = true; stopBtn.disabled = false;
-        await startVAD();
-        if (isMuted && vadInstance) vadInstance.pause();
-        setStatus(isMuted ? 'stopped' : 'listening', isMuted ? 'Muted' : undefined);
+        if (running || starting) return;
+        starting = true;
+        startBtn.disabled = true;
+        setStatus('listening', 'Starting...');
+        try {
+          const ok = await ensureConfig();
+          if (!ok) {
+            startBtn.disabled = false;
+            setStatus('stopped');
+            return;
+          }
+          const micPromise = requestMicPermission();
+          const unlockPromise = unlockAudio().catch((err) => {
+            console.error('Audio unlock failed', err);
+            if (unlockBtn) unlockBtn.style.display = 'inline-block';
+          });
+          const micOk = await micPromise;
+          if (!micOk) {
+            startBtn.disabled = false;
+            return;
+          }
+          await unlockPromise;
+          running = true;
+          stopBtn.disabled = false;
+          await startVAD();
+          if (isMuted && vadInstance) vadInstance.pause();
+          setStatus(isMuted ? 'stopped' : 'listening', isMuted ? 'Muted' : undefined);
+        } finally {
+          starting = false;
+          if (!running) startBtn.disabled = false;
+        }
       };
       const stop = () => {
         running = false;
+        starting = false;
         if (vadInstance) { vadInstance.pause(); vadInstance = null; }
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
         if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
