@@ -1038,7 +1038,11 @@
       const stop = () => {
         running = false;
         starting = false;
-        if (vadInstance) { vadInstance.pause(); vadInstance = null; }
+        if (vadInstance) {
+          try { vadInstance.pause(); } catch {}
+          try { vadInstance.destroy?.(); } catch {}
+          vadInstance = null;
+        }
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
         if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
         if (bargeInTimer) { clearTimeout(bargeInTimer); bargeInTimer = null; }
@@ -1075,10 +1079,14 @@
           isMuted = !isMuted;
           muteBtn.textContent = isMuted ? 'Unmute Mic' : 'Mute Mic';
           if (isMuted) {
-            if (vadInstance) vadInstance.pause();
+            if (vadInstance) {
+              try { vadInstance.pause(); } catch {}
+              try { vadInstance.destroy?.(); } catch {}
+              vadInstance = null;
+            }
             setStatus('stopped', 'Muted');
           } else {
-            if (running && vadInstance) vadInstance.start();
+            if (running) await startVAD();
             if (running) {
               if (isSpeaking) setStatus('speaking');
               else if (busy) setStatus('processing');
