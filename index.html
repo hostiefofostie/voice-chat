@@ -37,6 +37,8 @@
     <div id="controls">
       <button id="startBtn">Start Conversation</button>
       <button id="stopBtn" class="secondary" disabled>Stop Conversation</button>
+      <button id="endToggle" class="secondary">End: Auto</button>
+      <button id="endTurnBtn" class="secondary" style="display:none" disabled>End Turn</button>
       <button id="muteBtn" class="secondary">Mute Mic</button>
       <button id="unlockBtn" class="secondary" style="display:none">Unlock Audio</button>
       <button id="speechToggle" class="secondary">Speech: On</button>
@@ -72,6 +74,8 @@
         sendBtn = $('sendBtn'),
         startBtn = $('startBtn'),
         stopBtn = $('stopBtn'),
+        endToggle = $('endToggle'),
+        endTurnBtn = $('endTurnBtn'),
         muteBtn = $('muteBtn'),
         unlockBtn = $('unlockBtn'),
         speechToggle = $('speechToggle'),
@@ -95,10 +99,11 @@
       const BARGE_IN_HOLDOFF_MS = 700;
       const BARGE_IN_CONFIRM_MS = 400;
       const BARGE_IN_MIN_MS = 350;
-      const STREAM_TTS_ON_DELTA = true;
+      // Disable chunked TTS; wait for the final reply and speak it as one piece.
+      const STREAM_TTS_ON_DELTA = false;
       const TTS_CHUNK_MIN_CHARS = 18;
       const config = { sessionKey:'main', voice:'cedar', instructions: DEFAULT_TTS_INSTRUCTIONS };
-      let status='stopped', running=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, isTtsFetching=false, speechEnabled=true, isRecording=false, isMuted=false, lastAudioUrl=null, autoplayPrimed=false, autoplayPrimeAudio=null;
+      let status='stopped', running=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, isTtsFetching=false, speechEnabled=true, isRecording=false, isMuted=false, autoEndpointing=true, lastAudioUrl=null, autoplayPrimed=false, autoplayPrimeAudio=null;
       const audioQueue = [];
       const ttsQueue = [];
       let ttsStreamState = null;
@@ -108,6 +113,8 @@
       let adaptiveEndpointMs = ENDPOINT_SILENCE_MS;
       let lastTurnEndAt = 0;
       let lastTurnGapMs = null;
+      let lastCommittedTurnId = null;
+      let lastCommitAt = 0;
       let turnSeq = 0;
       let activeTurnId = 0;
       let currentTtsAbort = null;
@@ -315,6 +322,17 @@
         if (speechToggle) speechToggle.textContent = speechEnabled ? 'Speech: On' : 'Speech: Off';
       };
       const saveSpeechPref = () => localStorage.setItem('voice-chat-speech', speechEnabled ? 'on' : 'off');
+      const updateEndpointUi = () => {
+        if (endToggle) endToggle.textContent = autoEndpointing ? 'End: Auto' : 'End: Manual';
+        if (endTurnBtn) endTurnBtn.style.display = autoEndpointing ? 'none' : 'inline-block';
+        if (endTurnBtn) endTurnBtn.disabled = autoEndpointing || !pendingSpeech || isRecording;
+      };
+      const loadEndpointPref = () => {
+        const saved = localStorage.getItem('voice-chat-endpoint');
+        if (saved === 'manual') autoEndpointing = false;
+        updateEndpointUi();
+      };
+      const saveEndpointPref = () => localStorage.setItem('voice-chat-endpoint', autoEndpointing ? 'auto' : 'manual');
       const fillConfigForm = () => {
         $('sessionKey').value = config.sessionKey || '';
         $('voice').value = config.voice || '';
@@ -873,21 +891,36 @@
       // Endpointing: delay commit so short pauses can be merged into one turn.
       const finalizePendingSpeech = () => {
         if (!pendingSpeech) return;
+        const turnId = pendingSpeech.turnId || activeTurnId;
+        if (turnId && turnId === lastCommittedTurnId) {
+          console.log(`[endpoint] skip duplicate commit for turn ${turnId}`);
+          pendingSpeech = null;
+          pendingSpeechMeta = null;
+          updateEndpointUi();
+          return;
+        }
         const merged = mergeAudioChunks(pendingSpeech.chunks);
         const timing = {
-          turnId: pendingSpeech.turnId || activeTurnId,
+          turnId,
           gapMs: pendingSpeech.gapMs ?? null,
           speechMs: pendingSpeech.speechMs || 0,
           vadEndAt: Date.now()
         };
         pendingSpeech = null;
         pendingSpeechMeta = null;
+        lastCommittedTurnId = turnId;
+        lastCommitAt = Date.now();
         lastTurnEndAt = timing.vadEndAt;
         audioQueue.push({ audio: merged, timing });
         processNextAudio();
+        updateEndpointUi();
       };
       const scheduleEndpointCommit = () => {
         if (!pendingSpeech) return;
+        if (!autoEndpointing) {
+          updateEndpointUi();
+          return;
+        }
         if (endpointTimer) clearTimeout(endpointTimer);
         const silenceMs = computeEndpointMs(pendingSpeech.speechMs || 0);
         endpointTimer = setTimeout(() => {
@@ -895,6 +928,11 @@
           if (!running) return;
           finalizePendingSpeech();
         }, silenceMs);
+      };
+      const endTurn = () => {
+        if (!pendingSpeech || isRecording) return;
+        if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
+        finalizePendingSpeech();
       };
 
       const startVAD = async () => {
@@ -934,6 +972,7 @@
             if (endpointTimer) { clearTimeout(endpointTimer); endpointTimer = null; }
             isRecording = true;
             setStatus('recording');
+            updateEndpointUi();
           },
           onSpeechEnd: async (audio) => {
             if (!running) return;
@@ -951,6 +990,10 @@
             pendingSpeech.chunks.push(audio);
             pendingSpeech.speechMs += (audio.length / SAMPLE_RATE) * 1000;
             scheduleEndpointCommit();
+            if (!autoEndpointing && running) {
+              setStatus('listening', 'Waiting for end turn');
+            }
+            updateEndpointUi();
           },
           onnxWASMBasePath:'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
           baseAssetPath:'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/'
@@ -991,6 +1034,7 @@
         lastTurnEndAt = 0;
         lastTurnGapMs = null;
         setStatus('stopped'); startBtn.disabled = false; stopBtn.disabled = true;
+        updateEndpointUi();
       };
 
       startBtn.addEventListener('click', start);
@@ -1040,6 +1084,26 @@
           }
         });
       }
+      if (endToggle) {
+        endToggle.addEventListener('click', () => {
+          autoEndpointing = !autoEndpointing;
+          saveEndpointPref();
+          if (!autoEndpointing && endpointTimer) {
+            clearTimeout(endpointTimer);
+            endpointTimer = null;
+          }
+          if (autoEndpointing && pendingSpeech && !isRecording) scheduleEndpointCommit();
+          if (!autoEndpointing && running && pendingSpeech && !isRecording) {
+            setStatus('listening', 'Waiting for end turn');
+          }
+          updateEndpointUi();
+        });
+      }
+      if (endTurnBtn) {
+        endTurnBtn.addEventListener('click', () => {
+          endTurn();
+        });
+      }
       if (speechToggle) {
         speechToggle.addEventListener('click', async () => {
           speechEnabled = !speechEnabled;
@@ -1048,6 +1112,17 @@
           if (speechEnabled) {
             try { await ensureAudioContext(); audioUnlocked = true; } catch {}
             await tryPlayTts();
+          } else {
+            stopTtsPlayback('speech-off');
+            abortTtsFetch('speech-off');
+            clearPendingReplies('speech-off');
+            if (running) {
+              if (isRecording) setStatus('recording');
+              else if (busy) setStatus('processing');
+              else setStatus('listening');
+            } else {
+              setStatus('stopped');
+            }
           }
         });
       }
@@ -1062,6 +1137,7 @@
 
       loadConfig();
       loadSpeechPref();
+      loadEndpointPref();
       setStatus('stopped');
     })();
   </script>
