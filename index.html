@@ -898,9 +898,22 @@
         try {
           const wavBlob = float32ToWav(audioSamples);
           timing.transcribeStartAt = Date.now();
-          const transcript = (await transcribe(wavBlob)).trim();
+          let transcript = (await transcribe(wavBlob)).trim();
           timing.transcribeEndAt = Date.now();
           if (!transcript) return;
+          // Drain any queued audio segments and concatenate their transcriptions
+          // so split utterances become one message instead of separate turns.
+          while (audioQueue.length > 0) {
+            const extra = audioQueue.shift();
+            const extraAudio = extra?.audio || extra;
+            try {
+              const extraWav = float32ToWav(extraAudio);
+              const extraText = (await transcribe(extraWav)).trim();
+              if (extraText) transcript += ' ' + extraText;
+            } catch (err) {
+              console.warn('[processAudio] failed to transcribe queued segment:', err);
+            }
+          }
           updateAdaptiveEndpoint(transcript);
           addMessage('user', transcript);
           setStatus('thinking');
