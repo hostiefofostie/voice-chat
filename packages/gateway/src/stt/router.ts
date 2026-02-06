@@ -28,8 +28,12 @@ export class SttRouter extends EventEmitter {
         this.consecutiveFailures++;
         if (this.consecutiveFailures >= this.failureThreshold) {
           this.switchToFallback();
+          // After switching to fallback, use it immediately
+          return this.cloudFallback(audio);
         }
-        return this.cloudFallback(audio);
+        // Below threshold: re-throw so callers can show an error rather
+        // than sending a placeholder transcript to the LLM.
+        throw err;
       }
     }
     return this.cloudFallback(audio);

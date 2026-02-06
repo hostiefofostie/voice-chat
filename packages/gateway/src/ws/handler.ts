@@ -183,6 +183,10 @@ async function runLlmTtsPipeline(
 
   conn.ttsPipeline.reset();
 
+  // Capture the turnId for this invocation so async callbacks can detect
+  // if a newer pipeline run has replaced them (stale-turn guard).
+  const currentTurnId = turnId;
+
   // Wire up LLM events for this turn
   const onToken = ({ token, fullText }: { token: string; fullText: string }) => {
     sendMessage(conn, { type: 'llm_token', token, fullText });
@@ -204,6 +208,10 @@ async function runLlmTtsPipeline(
       app.log.error({ connId: conn.id, err }, 'TTS finish failed');
     }
 
+    // Guard: if a new turn started while we were awaiting finish(), don't
+    // clobber its state.  The new turn will manage its own idle transition.
+    if (conn.turnId !== currentTurnId) return;
+
     // Transition to idle after TTS completes
     if (conn.turnState === 'speaking' || conn.turnState === 'thinking') {
       conn.turnState = 'idle';
@@ -219,6 +227,8 @@ async function runLlmTtsPipeline(
       message: error instanceof Error ? error.message : 'LLM error',
       recoverable: true,
     });
+    // Guard against stale turns (same as onLlmDone)
+    if (conn.turnId !== currentTurnId) return;
     conn.turnState = 'idle';
     conn.turnId = null;
     sendMessage(conn, { type: 'turn_state', state: 'idle' });

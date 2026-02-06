@@ -99,3 +99,59 @@ When audio arrived in `idle` state (starting a new turn), leftover audio from a 
 - **After fixes:** 84/84 passing
 - Gateway builds clean with `tsc`
 - Client typechecks clean with `tsc --noEmit`
+
+---
+
+## Round 3 Addendum (2026-02-06)
+
+### 11. Fixed constructor mocking in handler pipeline tests (TEST SHOWSTOPPER)
+**File:** `packages/gateway/src/ws/__tests__/handler-pipeline.test.ts`
+
+Vitest v4 rejected constructor mocks written as arrow functions (`vi.fn().mockImplementation(() => ({...}))`) with `is not a constructor`, which caused all handler pipeline tests to fail and WebSocket connections to close with code 1006.
+
+**Fix:** Rewrote mocked class constructors (`GatewayClient`, `ParakeetClient`, `KokoroClient`, `OpenAiTtsClient`) to use function-style constructor implementations (`function (this: any) { ... }`) compatible with `new`.
+
+### 12. Fixed stale-turn race in WebSocket LLM/TTS orchestration (RACE CONDITION)
+**File:** `packages/gateway/src/ws/handler.ts`
+
+`onLlmDone`/`onLlmError` could finish asynchronously after a newer turn started and incorrectly force the connection back to `idle`, clobbering the newer turn state.
+
+**Fix:** Added turn-scoped stale-callback guards using captured `currentTurnId`; async callbacks now no-op when a newer turn has replaced the active one.
+
+### 13. Fixed STT fallback semantics to avoid placeholder transcript leakage
+**Files:**
+- `packages/gateway/src/stt/router.ts`
+- `packages/gateway/src/stt/__tests__/stt-router.test.ts`
+
+Before: any primary STT failure immediately returned cloud placeholder text (`[STT unavailable - local provider offline]`) even below threshold, which could be forwarded into LLM as user text.
+
+**Fix:**
+- Below failure threshold: rethrow STT error so caller can surface recoverable error.
+- At threshold: switch to fallback and return fallback result.
+- Updated tests for new threshold behavior and recovery path.
+
+### 14. Fixed reconnect/close race handling in GatewayClient + test stability
+**Files:**
+- `packages/gateway/src/llm/gateway-client.ts`
+- `packages/gateway/src/llm/__tests__/gateway-client.integration.test.ts`
+
+There was an intermittent unhandled rejection (`Gateway connection closed`) during integration tests due to asynchronous close/reconnect events after test teardown.
+
+**Fix:**
+- `ensureConnected()` now rejects early when client is closed (`shouldReconnect === false`).
+- Close/error handlers ignore stale socket events unless they belong to the active socket.
+- Integration test teardown now waits for async close handlers and suppresses known post-teardown close rejections.
+
+### 15. Fixed TypeScript test compile errors in async resolver callbacks
+**Files:**
+- `packages/gateway/src/ws/__tests__/handler-pipeline.test.ts`
+- `packages/gateway/src/tts/__tests__/tts-pipeline-advanced.test.ts`
+- `packages/gateway/src/tts/__tests__/tts-pipeline-generation.test.ts`
+
+TypeScript control-flow narrowing treated closure-assigned resolver variables as `never` at call sites.
+
+**Fix:** Added explicit callable union assertions at resolver invocation points.
+
+## Round 3 Verification
+- `cd packages/gateway && npx vitest run --reporter=verbose` → **213/213 passing**
+- `cd packages/gateway && npx tsc --noEmit` → clean

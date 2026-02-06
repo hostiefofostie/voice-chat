@@ -39,11 +39,9 @@ describe('SttRouter', () => {
     const switchHandler = vi.fn();
     router.on('provider_switched', switchHandler);
 
-    // First 2 failures don't trigger fallback (but return cloud stub response)
+    // First 2 failures re-throw (below threshold)
     for (let i = 0; i < 2; i++) {
-      const result = await router.transcribe(Buffer.alloc(100));
-      // Before threshold, still tries primary then falls back per-request
-      expect(result.text).toBe('[STT unavailable - local provider offline]');
+      await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow('Parakeet offline');
     }
 
     // Third failure hits threshold — switches permanently to fallback
@@ -70,8 +68,8 @@ describe('SttRouter', () => {
 
     // Call 1: success → consecutiveFailures = 0
     await router.transcribe(Buffer.alloc(100));
-    // Call 2: fail → consecutiveFailures = 1
-    await router.transcribe(Buffer.alloc(100));
+    // Call 2: fail → consecutiveFailures = 1, throws (below threshold)
+    await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow('temporary');
     // Call 3: success → consecutiveFailures = 0
     await router.transcribe(Buffer.alloc(100));
 
@@ -88,10 +86,11 @@ describe('SttRouter', () => {
     const recoveredHandler = vi.fn();
     router.on('provider_recovered', recoveredHandler);
 
-    // Trigger fallback
-    for (let i = 0; i < 3; i++) {
-      await router.transcribe(Buffer.alloc(100));
+    // Trigger fallback: first 2 throw (below threshold), 3rd switches
+    for (let i = 0; i < 2; i++) {
+      await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow();
     }
+    await router.transcribe(Buffer.alloc(100));
     expect(router.activeProvider).toBe('cloud_stub');
 
     // Now make health check succeed
@@ -123,6 +122,11 @@ describe('SttRouter', () => {
     const client = createMockClient(true);
     const router = new SttRouter(client);
 
+    // Need to hit the threshold to switch to fallback first
+    for (let i = 0; i < 2; i++) {
+      await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow();
+    }
+    // Third failure triggers fallback
     const result = await router.transcribe(Buffer.alloc(100));
     expect(result.confidence).toBe(0);
     expect(result.segments).toEqual([]);

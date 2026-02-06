@@ -33,6 +33,8 @@ interface GatewayFrame {
 interface ChatCallbacks {
   onDelta?: (text: string, payload: Record<string, unknown>) => void;
   onFinal?: (text: string, payload: Record<string, unknown>) => void;
+  /** Optional AbortSignal to cancel local waiting for stream completion. */
+  signal?: AbortSignal;
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,8 @@ interface PendingRun {
   onDelta?: (text: string, payload: Record<string, unknown>) => void;
   onFinal?: (text: string, payload: Record<string, unknown>) => void;
   finalSent: boolean;
+  abortSignal?: AbortSignal;
+  abortHandler?: () => void;
 }
 
 interface DeviceKeys {
@@ -556,6 +560,7 @@ export class GatewayClient {
   async ensureConnected(): Promise<void> {
     if (this.connected && this.ws && this.ws.readyState === WebSocket.OPEN) return;
     if (this.connecting) return this.connecting;
+    if (!this.shouldReconnect) throw new Error('Client is closed');
 
     this.connecting = new Promise<void>((resolve, reject) => {
       let connectReqId: string | null = null;
@@ -636,13 +641,15 @@ export class GatewayClient {
       ws.on('close', () => {
         clearTimeout(fallbackTimer);
         const err = new Error('Gateway connection closed');
-        this.handleDisconnect(err);
+        // Only handle disconnect if this socket is still the active one.
+        // After close(), this.ws is null — ignore stale close events.
+        if (this.ws === ws) this.handleDisconnect(err);
         if (!settled) finish(err);
       });
 
       ws.on('error', (wsErr: Error) => {
         clearTimeout(fallbackTimer);
-        this.handleDisconnect(wsErr);
+        if (this.ws === ws) this.handleDisconnect(wsErr);
         if (!settled) finish(wsErr);
       });
     });
@@ -756,13 +763,15 @@ export class GatewayClient {
     const isError = state === 'error' || payload['error'] !== undefined || payload['errorMessage'] !== undefined;
 
     let pending: PendingRun | undefined;
-    if (runId && this.pendingRuns.has(runId)) {
-      pending = this.pendingRuns.get(runId);
-    }
-    if (!pending && !runId && sessionKey && this.pendingSessions.has(sessionKey)) {
-      pending = this.pendingSessions.get(sessionKey);
-    }
+    if (runId) pending = this.pendingRuns.get(runId);
+    if (!pending && sessionKey) pending = this.pendingSessions.get(sessionKey);
     if (!pending) return;
+
+    // If we only had sessionKey at registration time, bind the runId once we see it.
+    if (runId && pending.runId === '') {
+      pending.runId = runId;
+      this.pendingRuns.set(runId, pending);
+    }
 
     if (isError) {
       const message = (payload['errorMessage'] as string | undefined)
@@ -807,6 +816,17 @@ export class GatewayClient {
 
   private resolvePending(pending: PendingRun, error?: Error, text?: string): void {
     if (pending.timer) clearTimeout(pending.timer);
+
+    if (pending.abortSignal && pending.abortHandler) {
+      try {
+        pending.abortSignal.removeEventListener('abort', pending.abortHandler);
+      } catch {
+        // ignore
+      }
+      pending.abortSignal = undefined;
+      pending.abortHandler = undefined;
+    }
+
     if (pending.runId) this.pendingRuns.delete(pending.runId);
     if (pending.sessionKey && this.pendingSessions.get(pending.sessionKey) === pending) {
       this.pendingSessions.delete(pending.sessionKey);
@@ -842,40 +862,88 @@ export class GatewayClient {
     message: string,
     callbacks: ChatCallbacks = {},
   ): Promise<string> {
-    const payload = await this.sendRequest('chat.send', {
-      sessionKey,
-      message,
-      idempotencyKey: randomUUID(),
-    });
-
-    const runId = (payload?.['runId'] as string | undefined)
-      ?? (payload?.['run'] as Record<string, unknown> | undefined)?.['id'] as string | undefined
-      ?? (payload?.['id'] as string | undefined);
-
-    if (!runId) {
-      return (payload?.['reply'] as string | undefined) ?? '';
-    }
+    // Ensure connection before we allocate pending state.
+    await this.ensureConnected();
 
     return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const safeResolve = (value: string) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const safeReject = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+
       const pending: PendingRun = {
-        runId,
+        // runId may arrive slightly after chat events start streaming.
+        // We associate early events using sessionKey until runId is known.
+        runId: '',
         sessionKey,
-        resolve,
-        reject,
+        resolve: safeResolve,
+        reject: safeReject,
         timer: null,
         buffer: '',
         lastDelta: '',
         onDelta: callbacks.onDelta,
         onFinal: callbacks.onFinal,
         finalSent: false,
+        abortSignal: callbacks.signal,
       };
 
+      // Timeout
       pending.timer = setTimeout(() => {
         this.resolvePending(pending, new Error('Gateway chat timeout'));
       }, GATEWAY_TIMEOUT_MS);
 
-      this.pendingRuns.set(runId, pending);
+      // Make this run discoverable by sessionKey immediately to avoid races where
+      // the gateway emits chat events right after the chat.send response.
       if (sessionKey) this.pendingSessions.set(sessionKey, pending);
+
+      // Optional local abort: stop waiting for the run to complete.
+      if (pending.abortSignal) {
+        if (pending.abortSignal.aborted) {
+          this.resolvePending(pending, new Error('Gateway chat aborted'));
+          return;
+        }
+        const onAbort = () => {
+          this.resolvePending(pending, new Error('Gateway chat aborted'));
+        };
+        pending.abortHandler = onAbort;
+        try {
+          pending.abortSignal.addEventListener('abort', onAbort, { once: true });
+        } catch {
+          // ignore
+        }
+      }
+
+      // Fire the request after pending is registered to avoid missing early events.
+      this.sendRequest('chat.send', {
+        sessionKey,
+        message,
+        idempotencyKey: randomUUID(),
+      }).then((payload) => {
+        if (settled) return;
+
+        const runId = (payload?.['runId'] as string | undefined)
+          ?? (payload?.['run'] as Record<string, unknown> | undefined)?.['id'] as string | undefined
+          ?? (payload?.['id'] as string | undefined);
+
+        if (!runId) {
+          const reply = (payload?.['reply'] as string | undefined) ?? '';
+          this.resolvePending(pending, undefined, reply);
+          return;
+        }
+
+        pending.runId = runId;
+        this.pendingRuns.set(runId, pending);
+      }).catch((err) => {
+        if (settled) return;
+        this.resolvePending(pending, err instanceof Error ? err : new Error(String(err)));
+      });
     });
   }
 }
