@@ -62,6 +62,33 @@ async function createVad(opts: {
 // Web VAD – @ricky0123/vad-web
 // ---------------------------------------------------------------------------
 
+/**
+ * Load onnxruntime-web from CDN. Metro can't parse onnxruntime-web's
+ * dynamic import(variable) syntax, so we redirect it to a shim that
+ * re-exports globalThis.ort. This function populates globalThis.ort
+ * by injecting a <script> tag and must be called before importing vad-web.
+ */
+const ONNX_CDN_URL =
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.1/dist/ort.min.js';
+let onnxLoadPromise: Promise<void> | null = null;
+
+function loadOnnxRuntime(): Promise<void> {
+  if (typeof globalThis !== 'undefined' && (globalThis as Record<string, unknown>).ort) {
+    return Promise.resolve();
+  }
+  if (!onnxLoadPromise) {
+    onnxLoadPromise = new Promise<void>((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = ONNX_CDN_URL;
+      script.onload = () => resolve();
+      script.onerror = () =>
+        reject(new Error('Failed to load onnxruntime-web from CDN'));
+      document.head.appendChild(script);
+    });
+  }
+  return onnxLoadPromise;
+}
+
 async function createWebVad(opts: {
   positiveSpeechThreshold: number;
   negativeSpeechThreshold: number;
@@ -72,7 +99,9 @@ async function createWebVad(opts: {
   onSpeechEnd: (audio: Float32Array) => void;
   stream: MediaStream;
 }): Promise<VadInstance> {
-  // Dynamic import so Metro never tries to resolve onnxruntime-web on native
+  // Load onnxruntime-web from CDN before importing vad-web, so that
+  // globalThis.ort is populated when our Metro shim is evaluated.
+  await loadOnnxRuntime();
   const { MicVAD } = await import('@ricky0123/vad-web');
 
   const vad = await MicVAD.new({
@@ -85,6 +114,12 @@ async function createWebVad(opts: {
     getStream: async () => opts.stream,
     onSpeechStart: opts.onSpeechStart,
     onSpeechEnd: opts.onSpeechEnd,
+    // Load WASM binaries and model from CDN to avoid Metro serving them
+    // with incorrect MIME types (which causes WebAssembly compile errors).
+    onnxWASMBasePath:
+      'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.1/dist/',
+    baseAssetPath:
+      'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/',
   });
 
   return {
