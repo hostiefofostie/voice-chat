@@ -10,6 +10,14 @@ import {
 } from '../types.js';
 import { executeCommand } from './commands.js';
 import { SlidingWindowRateLimiter } from './rate-limiter.js';
+import { ParakeetClient } from '../stt/parakeet-client.js';
+import { SttRouter } from '../stt/router.js';
+import { GatewayClient } from '../llm/gateway-client.js';
+import { LlmPipeline } from '../llm/pipeline.js';
+import { KokoroClient } from '../tts/kokoro-client.js';
+import { OpenAiTtsClient } from '../tts/openai-client.js';
+import { TtsRouter } from '../tts/router.js';
+import { TtsPipeline } from '../tts/pipeline.js';
 
 // ---------------------------------------------------------------------------
 // Connection State
@@ -27,12 +35,32 @@ interface ConnectionState {
   lastPingAt: number;
   messageLimiter: SlidingWindowRateLimiter;
   llmLimiter: SlidingWindowRateLimiter;
+  sttRouter: SttRouter;
+  llmPipeline: LlmPipeline;
+  ttsPipeline: TtsPipeline;
+  gatewayClient: GatewayClient;
 }
 
 const MAX_AUDIO_BUFFER_BYTES = 10 * 1024 * 1024; // 10 MB
 const RATE_LIMIT_MSG_PER_SEC = 100;
 const RATE_LIMIT_LLM_PER_MIN = 30;
 const KEEPALIVE_INTERVAL_MS = 30_000;
+
+// Audio-silence timeout: if no new audio arrives for this long during
+// LISTENING, auto-transition to transcribing.
+const AUDIO_SILENCE_TIMEOUT_MS = 1500;
+
+// ---------------------------------------------------------------------------
+// Shared Clients (singleton per process)
+// ---------------------------------------------------------------------------
+
+let _gatewayClient: GatewayClient | null = null;
+function getGatewayClient(): GatewayClient {
+  if (!_gatewayClient) {
+    _gatewayClient = new GatewayClient();
+  }
+  return _gatewayClient;
+}
 
 // ---------------------------------------------------------------------------
 // State Transitions
@@ -77,8 +105,164 @@ function cleanup(conn: ConnectionState) {
 }
 
 // ---------------------------------------------------------------------------
+// Audio Processing: transcribe buffered audio and send results
+// ---------------------------------------------------------------------------
+
+async function processAudioBuffer(
+  conn: ConnectionState,
+  app: FastifyInstance,
+) {
+  if (conn.audioBufferBytes === 0) {
+    app.log.warn({ connId: conn.id }, 'No audio to transcribe');
+    transitionState(conn, 'idle', app);
+    return;
+  }
+
+  if (!transitionState(conn, 'transcribing', app)) return;
+
+  const turnId = conn.turnId ?? crypto.randomUUID();
+  conn.turnId = turnId;
+
+  try {
+    const audioData = Buffer.concat(conn.audioBuffer);
+    cleanup(conn);
+
+    const result = await conn.sttRouter.transcribe(audioData);
+    app.log.info(
+      { connId: conn.id, turnId, text: result.text, confidence: result.confidence },
+      'Transcription complete',
+    );
+
+    if (!result.text || result.text.trim().length === 0) {
+      // Empty transcript — go back to idle
+      app.log.info({ connId: conn.id }, 'Empty transcript, returning to idle');
+      conn.turnState = 'idle';
+      conn.turnId = null;
+      sendMessage(conn, { type: 'turn_state', state: 'idle' });
+      return;
+    }
+
+    sendMessage(conn, {
+      type: 'transcript_final',
+      text: result.text,
+      turnId,
+    });
+    transitionState(conn, 'pending_send', app);
+  } catch (err) {
+    app.log.error({ connId: conn.id, err }, 'STT failed');
+    sendMessage(conn, {
+      type: 'error',
+      code: 'stt_error',
+      message: err instanceof Error ? err.message : 'STT failed',
+      recoverable: true,
+    });
+    // Return to idle on STT failure
+    conn.turnState = 'idle';
+    conn.turnId = null;
+    sendMessage(conn, { type: 'turn_state', state: 'idle' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LLM + TTS Pipeline: send transcript, stream tokens, synthesize audio
+// ---------------------------------------------------------------------------
+
+async function runLlmTtsPipeline(
+  conn: ConnectionState,
+  text: string,
+  turnId: string,
+  app: FastifyInstance,
+) {
+  // For text-input sends, we may be in idle (which can't transition to thinking).
+  // Force the state for this case.
+  if (conn.turnState === 'idle' || conn.turnState === 'listening' || conn.turnState === 'transcribing') {
+    app.log.info({ connId: conn.id, from: conn.turnState, to: 'thinking' }, 'State transition (text-input)');
+    conn.turnState = 'thinking';
+    sendMessage(conn, { type: 'turn_state', state: 'thinking', turnId: conn.turnId ?? undefined });
+  } else if (!transitionState(conn, 'thinking', app)) {
+    return;
+  }
+
+  conn.ttsPipeline.reset();
+
+  // Wire up LLM events for this turn
+  const onToken = ({ token, fullText }: { token: string; fullText: string }) => {
+    sendMessage(conn, { type: 'llm_token', token, fullText });
+  };
+  const onPhraseReady = ({ text: phraseText, index }: { text: string; index: number; turnId?: string }) => {
+    conn.ttsPipeline.processChunk(phraseText, index, turnId).catch((err) => {
+      app.log.error({ connId: conn.id, err }, 'TTS chunk processing failed');
+    });
+  };
+  const onLlmDone = async ({ fullText }: { fullText: string; cancelled?: boolean }) => {
+    sendMessage(conn, { type: 'llm_done', fullText });
+
+    // Finish TTS pipeline (wait for all queued chunks to complete)
+    try {
+      await conn.ttsPipeline.finish();
+    } catch (err) {
+      app.log.error({ connId: conn.id, err }, 'TTS finish failed');
+    }
+
+    // Transition to idle after TTS completes
+    if (conn.turnState === 'speaking' || conn.turnState === 'thinking') {
+      conn.turnState = 'idle';
+      conn.turnId = null;
+      sendMessage(conn, { type: 'turn_state', state: 'idle' });
+    }
+  };
+  const onLlmError = ({ error }: { error: unknown; turnId: string }) => {
+    app.log.error({ connId: conn.id, error }, 'LLM pipeline error');
+    sendMessage(conn, {
+      type: 'error',
+      code: 'llm_error',
+      message: error instanceof Error ? error.message : 'LLM error',
+      recoverable: true,
+    });
+    conn.turnState = 'idle';
+    conn.turnId = null;
+    sendMessage(conn, { type: 'turn_state', state: 'idle' });
+  };
+
+  conn.llmPipeline.on('llm_token', onToken);
+  conn.llmPipeline.on('phrase_ready', onPhraseReady);
+  conn.llmPipeline.on('llm_done', onLlmDone);
+  conn.llmPipeline.on('error', onLlmError);
+
+  // Transition to speaking when first TTS audio is ready
+  conn.ttsPipeline.on('done', () => {
+    // TTS complete — handled in onLlmDone
+  });
+
+  try {
+    // Transition to speaking state when first phrase goes to TTS
+    const oncePhrase = () => {
+      if (conn.turnState === 'thinking') {
+        transitionState(conn, 'speaking', app);
+      }
+      conn.llmPipeline.off('phrase_ready', oncePhrase);
+    };
+    conn.llmPipeline.on('phrase_ready', oncePhrase);
+
+    await conn.llmPipeline.sendTranscript(
+      text,
+      conn.config.sessionKey || 'default',
+      turnId,
+    );
+  } finally {
+    conn.llmPipeline.off('llm_token', onToken);
+    conn.llmPipeline.off('phrase_ready', onPhraseReady);
+    conn.llmPipeline.off('llm_done', onLlmDone);
+    conn.llmPipeline.off('error', onLlmError);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Binary Frame Handling
 // ---------------------------------------------------------------------------
+
+// Per-connection silence timers
+const silenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function handleAudioFrame(
   conn: ConnectionState,
@@ -87,6 +271,7 @@ function handleAudioFrame(
 ) {
   if (conn.turnState === 'idle') {
     // Implicit start of listening when audio arrives in idle state
+    cleanup(conn); // Clear any leftover audio from a previous turn
     conn.turnId = crypto.randomUUID();
     if (!transitionState(conn, 'listening', app)) return;
   }
@@ -116,7 +301,22 @@ function handleAudioFrame(
   conn.audioBuffer.push(data);
   conn.audioBufferBytes += data.length;
 
-  // Future: forward to STT rolling-window processor
+  // Reset silence timer — when no audio arrives for AUDIO_SILENCE_TIMEOUT_MS,
+  // auto-transition to transcribing. This handles the case where the client
+  // sends a complete WAV blob from VAD onSpeechEnd.
+  const existing = silenceTimers.get(conn.id);
+  if (existing) clearTimeout(existing);
+  silenceTimers.set(
+    conn.id,
+    setTimeout(() => {
+      silenceTimers.delete(conn.id);
+      if (conn.turnState === 'listening' && conn.audioBufferBytes > 0) {
+        processAudioBuffer(conn, app).catch((err) => {
+          app.log.error({ connId: conn.id, err }, 'Audio processing failed');
+        });
+      }
+    }, AUDIO_SILENCE_TIMEOUT_MS),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -143,11 +343,15 @@ function handleJsonMessage(
         });
         return;
       }
-      // Future: forward to LLM pipeline
       app.log.info(
-        { connId: conn.id, turnId: msg.turnId },
+        { connId: conn.id, turnId: msg.turnId, text: msg.text },
         'Received transcript_send',
       );
+      conn.turnId = msg.turnId;
+      cleanup(conn); // Clear audio buffer since we have the final text
+      runLlmTtsPipeline(conn, msg.text, msg.turnId, app).catch((err) => {
+        app.log.error({ connId: conn.id, err }, 'LLM/TTS pipeline failed');
+      });
       break;
 
     case 'command':
@@ -172,6 +376,8 @@ function handleJsonMessage(
       // Stop TTS, transition to idle
       app.log.info({ connId: conn.id }, 'Barge-in received');
       if (conn.turnState === 'speaking') {
+        conn.ttsPipeline.cancel();
+        conn.llmPipeline.cancel();
         conn.turnId = null;
         transitionState(conn, 'idle', app);
       }
@@ -181,6 +387,8 @@ function handleJsonMessage(
       // Abort current pipeline, transition to idle
       app.log.info({ connId: conn.id, state: conn.turnState }, 'Cancel received');
       if (conn.turnState !== 'idle') {
+        conn.llmPipeline.cancel();
+        conn.ttsPipeline.cancel();
         cleanup(conn);
         conn.turnId = null;
         // Force state to idle (bypass normal transition validation for cancel)
@@ -216,6 +424,15 @@ function handleJsonMessage(
 
 export function registerWebSocket(app: FastifyInstance) {
   app.get('/ws', { websocket: true }, (socket, req) => {
+    // Create per-connection pipeline instances
+    const gatewayClient = getGatewayClient();
+    const parakeetClient = new ParakeetClient();
+    const sttRouter = new SttRouter(parakeetClient);
+    const llmPipeline = new LlmPipeline(gatewayClient);
+    const kokoroClient = new KokoroClient();
+    const openaiTtsClient = new OpenAiTtsClient();
+    const ttsRouter = new TtsRouter(kokoroClient, openaiTtsClient);
+
     const conn: ConnectionState = {
       id: crypto.randomUUID(),
       ws: socket,
@@ -228,6 +445,14 @@ export function registerWebSocket(app: FastifyInstance) {
       lastPingAt: Date.now(),
       messageLimiter: new SlidingWindowRateLimiter(RATE_LIMIT_MSG_PER_SEC, 1_000),
       llmLimiter: new SlidingWindowRateLimiter(RATE_LIMIT_LLM_PER_MIN, 60_000),
+      sttRouter,
+      llmPipeline,
+      ttsPipeline: new TtsPipeline({
+        ttsRouter,
+        sendJson: (msg) => sendMessage(conn, msg),
+        sendBinary: (data) => sendBinary(conn, data),
+      }),
+      gatewayClient,
     };
 
     app.log.info({ connId: conn.id }, 'WebSocket connected');
@@ -265,6 +490,12 @@ export function registerWebSocket(app: FastifyInstance) {
       cleanup(conn);
       conn.messageLimiter.reset();
       conn.llmLimiter.reset();
+      sttRouter.destroy();
+      const silenceTimer = silenceTimers.get(conn.id);
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimers.delete(conn.id);
+      }
       clearInterval(keepalive);
     });
 

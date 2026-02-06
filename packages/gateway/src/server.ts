@@ -44,6 +44,9 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 const start = async () => {
   await app.listen({ port: Number(process.env.PORT || 8788), host: '0.0.0.0' });
 };
-start();
+start().catch((err) => {
+  app.log.error(err, 'Failed to start server');
+  process.exit(1);
+});
 
 export default app;

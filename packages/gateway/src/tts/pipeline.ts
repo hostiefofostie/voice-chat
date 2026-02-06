@@ -81,7 +81,7 @@ export class TtsPipeline extends EventEmitter {
       this.completedAudio.set(index, audio);
       this.inFlight--;
       this.sendInOrder();
-      this.dispatch();
+      await this.dispatch();
     } catch (err) {
       this.inFlight--;
       this.emit('error', err);

@@ -24,9 +24,11 @@ export const useChatStore = create<ChatStore>((set) => ({
     }]
   })),
   updateLastAssistant: (text) => set(state => {
-    const msgs = [...state.messages];
-    const last = msgs.findLast(m => m.role === 'assistant');
-    if (last) last.text = text;
+    const lastIdx = state.messages.findLastIndex(m => m.role === 'assistant');
+    if (lastIdx === -1) return state;
+    const msgs = state.messages.map((m, i) =>
+      i === lastIdx ? { ...m, text } : m,
+    );
     return { messages: msgs };
   }),
   clear: () => set({ messages: [] }),

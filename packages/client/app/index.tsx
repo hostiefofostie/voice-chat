@@ -102,7 +102,8 @@ export default function Index() {
 
           case 'llm_done':
             addMessage({ role: 'assistant', text: msg.fullText });
-            resetTurn();
+            // Don't resetTurn() here — the server will transition to 'speaking'
+            // for TTS playback. Let the server-authoritative turn_state drive it.
             useErrorStore.getState().reportLlmDone();
             break;
 
@@ -185,13 +186,19 @@ export default function Index() {
     sendBinary: ws.sendBinary,
     onSpeechStart: useCallback(() => {
       const currentState = useTurnStore.getState().state;
-      // Barge-in: user starts speaking during playback
       if (currentState === 'speaking') {
+        // Barge-in: user starts speaking during playback
         playbackRef.current.stop();
         wsRef.current?.send({ type: 'barge_in' });
+        reconcile('listening');
+      } else if (currentState === 'idle') {
+        transition('listening');
+      } else {
+        // Speaking during thinking/transcribing/pending_send — cancel and restart
+        wsRef.current?.send({ type: 'cancel' });
+        reconcile('listening');
       }
-      transition('listening');
-    }, [transition]),
+    }, [transition, reconcile]),
     onSpeechEnd: useCallback(() => {
       transition('transcribing');
     }, [transition]),
@@ -223,9 +230,12 @@ export default function Index() {
         useTurnStore.getState().turnId ?? crypto.randomUUID();
       addMessage({ role: 'user', text });
       ws.send({ type: 'transcript_send', text, turnId });
-      transition('thinking');
+      // Use reconcile for optimistic UI — transition() would fail from
+      // idle->thinking since it's not a valid step in the state machine.
+      // Server will send authoritative turn_state messages.
+      reconcile('thinking', turnId);
     },
-    [addMessage, ws, transition],
+    [addMessage, ws, reconcile],
   );
 
   const handleCancelTranscript = useCallback(() => {
@@ -241,9 +251,9 @@ export default function Index() {
     const turnId = crypto.randomUUID();
     addMessage({ role: 'user', text });
     ws.send({ type: 'transcript_send', text, turnId });
-    transition('thinking');
+    reconcile('thinking', turnId);
     setTextInput('');
-  }, [textInput, addMessage, ws, transition]);
+  }, [textInput, addMessage, ws, reconcile]);
 
   // ---- LLM retry: resend the last user message ----
   const handleRetryLlm = useCallback(() => {
@@ -256,9 +266,9 @@ export default function Index() {
     if (lastUser) {
       const turnId = crypto.randomUUID();
       ws.send({ type: 'transcript_send', text: lastUser.text, turnId });
-      transition('thinking');
+      reconcile('thinking', turnId);
     }
-  }, [ws, resetTurn, transition]);
+  }, [ws, resetTurn, reconcile]);
 
   // ---- LLM cancel ----
   const handleCancelLlm = useCallback(() => {
