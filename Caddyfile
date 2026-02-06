@@ -6,6 +6,16 @@ clawds-macbook-pro.taild6b854.ts.net:8443 {
     }
     reverse_proxy @websocket localhost:18789
 
+    @voicews {
+        path /ws
+    }
+    reverse_proxy @voicews localhost:8788
+
+    @health {
+        path /health
+    }
+    reverse_proxy @health localhost:8788
+
     @api {
         path /api/*
     }

@@ -1,0 +1,17 @@
+{
+  "name": "voice-chat",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:gateway": "npm run dev --workspace=@voice-chat/gateway",
+    "dev:client": "npm run dev --workspace=@voice-chat/client",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "start": "pm2 start ecosystem.config.js",
+    "stop": "pm2 stop voice-gateway",
+    "logs": "pm2 logs voice-gateway"
+  }
+}

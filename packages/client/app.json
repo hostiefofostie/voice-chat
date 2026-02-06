@@ -1,0 +1,13 @@
+{
+  "expo": {
+    "name": "Voice Chat",
+    "slug": "voice-chat",
+    "version": "0.1.0",
+    "scheme": "voice-chat",
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": ["expo-router"]
+  }
+}

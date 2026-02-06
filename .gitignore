@@ -1,3 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.expo/
+web-build/
+
+# Environment
+.env
+.env.local
+
+# OS files
+.DS_Store
+
+# TypeScript
+*.tsbuildinfo
+
+# Project-specific
 .ntm/
 .voicechat-device.json
 *.pem
