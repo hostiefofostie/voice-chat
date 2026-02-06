@@ -197,9 +197,10 @@ export function useWebSocket(
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(data);
-    } else {
-      sendQueueRef.current.push(data);
     }
+    // Intentionally do NOT queue binary data during disconnect.
+    // Stale audio frames flushed on reconnect would confuse the server's
+    // turn state machine (audio arriving from a previous turn).
   }, []);
 
   const disconnect = useCallback(() => {

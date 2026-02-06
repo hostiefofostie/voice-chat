@@ -68,7 +68,9 @@ export function useAudioCapture(
       });
     } catch (err) {
       console.error('[useAudioCapture] Microphone permission denied:', err);
-      return;
+      // Re-throw so callers (e.g. handleMicToggle) can report the denial
+      // to the error recovery system.
+      throw err;
     }
 
     // Guard against unmount while awaiting mic permission

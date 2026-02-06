@@ -155,3 +155,79 @@ TypeScript control-flow narrowing treated closure-assigned resolver variables as
 ## Round 3 Verification
 - `cd packages/gateway && npx vitest run --reporter=verbose` → **213/213 passing**
 - `cd packages/gateway && npx tsc --noEmit` → clean
+
+---
+
+## Round 4 — Client Review + Final Gateway Pass (2026-02-06)
+
+First comprehensive review of `packages/client/`. Also final pass on gateway code.
+
+### 16. Fixed premature playback-end in audio playback hook (CLIENT BUG)
+**File:** `packages/client/hooks/useAudioPlayback.ts`
+
+`playNext()` declared playback complete (`onPlaybackEnd()`) whenever the queue was empty and no chunk was processing. But more TTS chunks could still be in flight from the server — the queue drains faster than the server can send. This caused `onPlaybackEnd` → `transition('idle')` to fire mid-response, cutting off TTS audio.
+
+**Fix:** Added `ttsDoneRef` flag. `playNext()` now only fires `onPlaybackEnd` when both the queue is empty AND `markDone()` has been called. The `tts_done` server message triggers `markDone()`. Added `markDone()` to the hook's return API.
+
+### 17. Fixed tts_done message not wired to playback hook (CLIENT BUG)
+**File:** `packages/client/app/index.tsx`
+
+The `tts_done` handler was a no-op comment ("Playback handles its own completion via queue drain"). But playback cannot know when the server is done sending chunks without this signal.
+
+**Fix:** `tts_done` handler now calls `playbackRef.current.markDone()`.
+
+### 18. Fixed duplicate streaming message in ChatHistory (CLIENT BUG)
+**File:** `packages/client/app/index.tsx`
+
+When `llm_done` fires, `addMessage()` adds the assistant message to the persistent `messages` array. But `turnStore.llmText` still contains the full response text, and `ChatHistory` renders a streaming bubble whenever `(turnState === 'thinking' || turnState === 'speaking') && llmText.length > 0`. During the `speaking` phase (between `llm_done` and `turn_state: idle`), both the persistent message and the streaming bubble were visible — a duplicate.
+
+**Fix:** Clear `llmText` on `llm_done` via `useTurnStore.getState().appendLlmToken('', '')`.
+
+### 19. Fixed stale binary audio queue on reconnect (CLIENT BUG)
+**File:** `packages/client/hooks/useWebSocket.ts`
+
+`sendBinary()` queued `ArrayBuffer` data in `sendQueueRef` when the WebSocket was disconnected. On reconnect, `flushQueue()` sent all buffered audio to the server. Stale audio from a previous turn would confuse the server's turn state machine (starting a new "listening" phase from audio recorded minutes ago).
+
+**Fix:** `sendBinary()` now drops data when disconnected instead of queuing. Binary audio is ephemeral — queueing it serves no purpose since the turn context is lost on disconnect.
+
+### 20. Fixed double getUserMedia call on mic toggle (CLIENT BUG)
+**Files:** `packages/client/app/index.tsx`, `packages/client/hooks/useAudioCapture.ts`
+
+`handleMicToggle` called `navigator.mediaDevices.getUserMedia()` to test permission, stopped the tracks, then called `capture.start()` which called `getUserMedia()` again. This caused a brief "mic flash" on some devices and wasted the user's time on the permission prompt.
+
+**Fix:** `useAudioCapture.start()` now re-throws the permission error instead of swallowing it. `handleMicToggle` calls `capture.start()` directly and catches to report mic denial to the error store.
+
+### 21. Fixed config changes not sent to server (CLIENT BUG)
+**File:** `packages/client/app/index.tsx`
+
+The settings page updates `configStore` (Zustand), but nothing sent the updated config to the server via WebSocket. The server always used `DEFAULT_CONFIG` for every connection, ignoring user preferences for TTS voice, STT provider, VAD sensitivity, etc.
+
+**Fix:** Added `useConfigStore.subscribe()` effect that sends a `config` message to the server whenever the config store changes. Also sends the full config on WebSocket connect/reconnect so the server starts with the right settings.
+
+### 22. Fixed LLM cancel flushing remaining phrases to TTS (GATEWAY BUG)
+**File:** `packages/gateway/src/llm/pipeline.ts`
+
+`cancel()` called `this.phraseChunker.feed('', true)` which flushed remaining buffered text as `phrase_ready` events. These events are processed synchronously by the handler, which calls `ttsPipeline.processChunk()` → `dispatch()` → starts new TTS synthesis. This happens *before* the handler calls `ttsPipeline.cancel()`, creating a race where cancelled turns could still trigger TTS synthesis work.
+
+**Fix:** `cancel()` now calls `this.phraseChunker.reset()` instead of flushing. When cancelling, there's no point synthesizing remaining text — the user asked to stop.
+
+## Round 4 Verification
+- `cd packages/gateway && npx vitest run --reporter=verbose` → **213/213 passing**
+- `cd packages/gateway && npx tsc --noEmit` → clean
+- `cd packages/client && npx tsc --noEmit` → clean
+
+## What Was Reviewed and Found Correct (Client)
+- WebSocket reconnection with exponential backoff (correct delays, proper cleanup)
+- Turn state machine transitions match server-side `VALID_TRANSITIONS` exactly
+- Zustand stores use immutable updates (chatStore `updateLastAssistant` fixed in R1, rest correct)
+- React hooks have proper dependency arrays and cleanup functions
+- Audio WAV encoding (`float32ToWav`) produces correct 16-bit PCM headers
+- VAD integration (`@ricky0123/vad-web`) properly handles async init/destroy lifecycle
+- AudioContext lazy creation respects browser autoplay policy
+- Barge-in flow correctly stops playback, sends `barge_in` to server, reconciles state
+- Error recovery system properly tracks STT/TTS/LLM errors with thresholds
+- LLM timeout tracker uses tiered approach (15s warning, 30s with retry option)
+- TranscriptBox auto-send countdown resets on user edit (correct)
+- Settings page properly renders web-only controls with native fallback text
+- Expo Router layout and navigation structure correct
+- `KeyboardAvoidingView` uses correct platform-specific behavior

@@ -19,6 +19,10 @@ export class TtsPipeline extends EventEmitter {
   private completedAudio: Map<number, Buffer> = new Map();
   private inFlight: number = 0;
   private cancelled: boolean = false;
+  // Generation counter — incremented on reset() so stale in-flight synthesis
+  // from a previous turn does not corrupt state (e.g. decrementing inFlight
+  // below zero after reset set it to 0).
+  private generation: number = 0;
 
   constructor(options: TtsPipelineOptions) {
     super();
@@ -56,6 +60,7 @@ export class TtsPipeline extends EventEmitter {
     this.nextSendIndex = 0;
     this.inFlight = 0;
     this.cancelled = false;
+    this.generation++;
   }
 
   private async dispatch() {
@@ -73,13 +78,18 @@ export class TtsPipeline extends EventEmitter {
   }
 
   private async synthesizeAndQueue(text: string, index: number) {
+    const gen = this.generation;
     try {
       const { audio } = await this.ttsRouter.synthesize(text);
+      // If cancel()+reset() happened while synthesis was in-flight, this result
+      // belongs to a stale turn.  Ignore it — reset() already zeroed inFlight.
+      if (gen !== this.generation) return;
       this.completedAudio.set(index, audio);
       this.inFlight--;
       this.sendInOrder();
       await this.dispatch();
     } catch (err) {
+      if (gen !== this.generation) return;
       this.inFlight--;
       this.emit('error', err);
     }
@@ -87,6 +97,12 @@ export class TtsPipeline extends EventEmitter {
 
   private sendInOrder() {
     while (this.completedAudio.has(this.nextSendIndex)) {
+      if (this.cancelled) {
+        // Discard completed audio after cancel — don't send stale chunks
+        this.completedAudio.clear();
+        return;
+      }
+
       const audio = this.completedAudio.get(this.nextSendIndex)!;
       this.completedAudio.delete(this.nextSendIndex);
 
@@ -94,11 +110,12 @@ export class TtsPipeline extends EventEmitter {
       let sampleRate = 16000;
       let durationMs = 0;
       if (audio.length >= 44) {
-        sampleRate = audio.readUInt32LE(24) || 16000;
+        const rawSampleRate = audio.readUInt32LE(24);
+        sampleRate = rawSampleRate || 16000;
         const dataSize = audio.length - 44;
         const bytesPerSample = 2; // 16-bit
-        durationMs = sampleRate > 0
-          ? Math.round(dataSize / (sampleRate * bytesPerSample) * 1000)
+        durationMs = rawSampleRate > 0
+          ? Math.round(dataSize / (rawSampleRate * bytesPerSample) * 1000)
           : 0;
       }
 

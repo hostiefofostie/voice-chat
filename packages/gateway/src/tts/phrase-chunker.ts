@@ -17,19 +17,24 @@ export class PhraseChunker {
   feed(text: string, isFinal: boolean = false): PhraseChunk[] {
     this.buffer += text;
     const chunks: PhraseChunk[] = [];
+    let searchFrom = 0;
 
     while (true) {
-      const split = this.findSplitPoint();
+      const split = this.findSplitPoint(searchFrom);
       if (split === -1) break;
 
       const chunk = this.buffer.substring(0, split).trim();
-      this.buffer = this.buffer.substring(split);
 
       if (chunk && this.wordCount(chunk) >= PhraseChunker.MIN_WORDS) {
+        this.buffer = this.buffer.substring(split);
+        searchFrom = 0;
         chunks.push({ text: chunk, index: this.chunkIndex++ });
-      } else if (chunk) {
-        // Too short -- prepend back to buffer for merging with next chunk
-        this.buffer = chunk + ' ' + this.buffer;
+      } else {
+        // Chunk is too short — skip past this split point and look for the
+        // next boundary.  The short prefix will merge with the following
+        // text into a larger chunk.  Without this guard the loop would
+        // infinite-loop: split → prepend → same split → repeat.
+        searchFrom = split;
       }
     }
 
@@ -51,7 +56,7 @@ export class PhraseChunker {
   // Split-point detection
   // ---------------------------------------------------------------------------
 
-  private findSplitPoint(): number {
+  private findSplitPoint(startFrom: number = 0): number {
     const buf = this.buffer;
     if (buf.length === 0) return -1;
 
@@ -59,18 +64,18 @@ export class PhraseChunker {
     if (this.insideCodeBlock()) return -1;
 
     // 1. Try sentence boundaries (. ! ? ...)
-    const sentenceEnd = this.findSentenceBoundary();
+    const sentenceEnd = this.findSentenceBoundary(startFrom);
     if (sentenceEnd !== -1) return sentenceEnd;
 
     // 2. For long buffers, try pause-point splits (comma, semicolon, em-dash, colon)
     if (buf.length > 100) {
-      const pauseEnd = this.findPauseBoundary();
+      const pauseEnd = this.findPauseBoundary(startFrom);
       if (pauseEnd !== -1) return pauseEnd;
     }
 
     // 3. For very long buffers, force a split at the nearest word boundary
     if (buf.length > PhraseChunker.MAX_CHARS) {
-      return this.findForcedSplit();
+      return this.findForcedSplit(startFrom);
     }
 
     return -1;
@@ -80,10 +85,10 @@ export class PhraseChunker {
    * Find the first valid sentence-ending boundary in the buffer.
    * Returns the index *after* the boundary (i.e. where the next chunk starts).
    */
-  private findSentenceBoundary(): number {
+  private findSentenceBoundary(startFrom: number = 0): number {
     const buf = this.buffer;
 
-    for (let i = 0; i < buf.length; i++) {
+    for (let i = startFrom; i < buf.length; i++) {
       // Skip characters inside URLs
       if (this.isInsideUrl(i)) continue;
 
@@ -132,12 +137,12 @@ export class PhraseChunker {
    * Only used when buffer exceeds 100 chars without a sentence boundary.
    * Searches from the end backward to get the longest possible chunk under MAX_CHARS.
    */
-  private findPauseBoundary(): number {
+  private findPauseBoundary(startFrom: number = 0): number {
     const buf = this.buffer;
     const limit = Math.min(buf.length, PhraseChunker.MAX_CHARS);
 
     // Search backward from the limit to find a pause point
-    for (let i = limit - 1; i >= 0; i--) {
+    for (let i = limit - 1; i >= startFrom; i--) {
       if (this.isInsideUrl(i)) continue;
 
       const ch = buf[i];
@@ -156,18 +161,19 @@ export class PhraseChunker {
   /**
    * Force a split at a word boundary when the buffer exceeds MAX_CHARS.
    */
-  private findForcedSplit(): number {
+  private findForcedSplit(startFrom: number = 0): number {
     const buf = this.buffer;
-    // Find the last space before MAX_CHARS
+    // Find the last space between startFrom and MAX_CHARS
     let lastSpace = -1;
-    for (let i = 0; i < PhraseChunker.MAX_CHARS && i < buf.length; i++) {
+    for (let i = Math.max(startFrom, 0); i < PhraseChunker.MAX_CHARS && i < buf.length; i++) {
       if (buf[i] === ' ') lastSpace = i;
     }
     if (lastSpace > 0) {
       return this.advancePastWhitespace(lastSpace);
     }
-    // No space found -- split at MAX_CHARS as last resort
-    return PhraseChunker.MAX_CHARS;
+    // No space found after startFrom — split at MAX_CHARS if we haven't passed it
+    if (startFrom < PhraseChunker.MAX_CHARS) return PhraseChunker.MAX_CHARS;
+    return -1;
   }
 
   // ---------------------------------------------------------------------------

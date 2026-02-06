@@ -14,6 +14,8 @@ export interface TtsChunkMeta {
 export interface UseAudioPlaybackReturn {
   isPlaying: boolean;
   queueChunk: (meta: TtsChunkMeta, audioData: ArrayBuffer) => void;
+  /** Signal that no more chunks will arrive (tts_done received). */
+  markDone: () => void;
   stop: () => void;
   setVolume: (vol: number) => void;
 }
@@ -60,6 +62,10 @@ export function useAudioPlayback(options: {
   const isProcessingRef = useRef(false);
   const nextExpectedIndexRef = useRef(0);
   const unmountedRef = useRef(false);
+  // Whether the server has signalled tts_done (no more chunks coming).
+  // Without this flag, playNext() can't distinguish "chunks still in flight"
+  // from "all chunks played" when the queue is empty.
+  const ttsDoneRef = useRef(false);
 
   // ------ internal helpers ------
 
@@ -92,12 +98,14 @@ export function useAudioPlayback(options: {
       (c) => c.meta.index === nextExpectedIndexRef.current,
     );
     if (idx === -1) {
-      // Expected chunk hasn't arrived yet, or queue is empty
-      if (queue.length === 0 && isPlayingRef.current) {
-        // No more chunks and nothing pending — playback is done
+      // Expected chunk hasn't arrived yet, or queue is empty.
+      // Only declare playback done if the server has signalled tts_done
+      // (no more chunks coming). Otherwise more chunks may still be in flight.
+      if (queue.length === 0 && isPlayingRef.current && ttsDoneRef.current) {
         isPlayingRef.current = false;
         setIsPlaying(false);
         nextExpectedIndexRef.current = 0;
+        ttsDoneRef.current = false;
         optionsRef.current.onPlaybackEnd();
       }
       return;
@@ -178,6 +186,19 @@ export function useAudioPlayback(options: {
     [playNext],
   );
 
+  /** Signal that no more chunks will arrive from the server (tts_done). */
+  const markDone = useCallback(() => {
+    ttsDoneRef.current = true;
+    // If nothing is processing and the queue is empty, end playback now.
+    if (!isProcessingRef.current && queueRef.current.length === 0 && isPlayingRef.current) {
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+      nextExpectedIndexRef.current = 0;
+      ttsDoneRef.current = false;
+      optionsRef.current.onPlaybackEnd();
+    }
+  }, []);
+
   const stop = useCallback(() => {
     // Clear the queue
     queueRef.current = [];
@@ -195,6 +216,7 @@ export function useAudioPlayback(options: {
     }
 
     isProcessingRef.current = false;
+    ttsDoneRef.current = false;
 
     if (isPlayingRef.current) {
       isPlayingRef.current = false;
@@ -244,5 +266,5 @@ export function useAudioPlayback(options: {
     };
   }, []);
 
-  return { isPlaying, queueChunk, stop, setVolume };
+  return { isPlaying, queueChunk, markDone, stop, setVolume };
 }

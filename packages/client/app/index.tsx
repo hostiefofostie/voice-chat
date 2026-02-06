@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -16,6 +16,7 @@ import { useAudioPlayback, TtsChunkMeta } from '../hooks/useAudioPlayback';
 import { useErrorRecovery, useErrorStore, useLlmTimeoutTracker } from '../hooks/useErrorRecovery';
 import { useTurnStore } from '../stores/turnStore';
 import { useChatStore } from '../stores/chatStore';
+import { useConfigStore } from '../stores/configStore';
 import ChatHistory from '../components/ChatHistory';
 import TranscriptBox from '../components/TranscriptBox';
 import StatusIndicator from '../components/StatusIndicator';
@@ -104,6 +105,9 @@ export default function Index() {
             addMessage({ role: 'assistant', text: msg.fullText });
             // Don't resetTurn() here — the server will transition to 'speaking'
             // for TTS playback. Let the server-authoritative turn_state drive it.
+            // Clear the streaming LLM text so ChatHistory doesn't show it as a
+            // duplicate of the just-added persistent message.
+            useTurnStore.getState().appendLlmToken('', '');
             useErrorStore.getState().reportLlmDone();
             break;
 
@@ -117,7 +121,10 @@ export default function Index() {
             break;
 
           case 'tts_done':
-            // Playback handles its own completion via queue drain
+            // Signal the playback hook that no more audio chunks will arrive.
+            // Without this, playNext() can't tell "waiting for more chunks"
+            // from "all chunks played" when the queue drains.
+            playbackRef.current.markDone();
             break;
 
           case 'turn_state':
@@ -170,6 +177,9 @@ export default function Index() {
     onConnect: useCallback(() => {
       // Auto-recovery: WS connected, clear disconnect error
       useErrorStore.getState().setWsDisconnected(false);
+      // Send current config to server so it knows our preferences
+      const config = useConfigStore.getState().config;
+      wsRef.current?.send({ type: 'config', settings: config });
     }, []),
 
     onDisconnect: useCallback(() => {
@@ -180,6 +190,18 @@ export default function Index() {
 
   const ws = useWebSocket(GATEWAY_URL, wsHandlers);
   wsRef.current = ws;
+
+  // ---- Sync config store changes to server ----
+  useEffect(() => {
+    const unsub = useConfigStore.subscribe((state, prev) => {
+      if (state.config !== prev.config && wsRef.current) {
+        wsRef.current.send({ type: 'config', settings: state.config });
+        // Also sync auto-send delay to the turn store
+        useTurnStore.setState({ autoSendDelayMs: state.config.autoSendDelayMs });
+      }
+    });
+    return unsub;
+  }, []);
 
   // ---- Audio capture ----
   const capture = useAudioCapture({
@@ -211,12 +233,13 @@ export default function Index() {
     if (capture.isCapturing) {
       capture.stop();
     } else {
-      // Check if mic permission is available before starting
+      // Start capture directly — useAudioCapture already handles getUserMedia
+      // and logs permission denial. We catch here to report it to the error store.
       try {
-        const permResult = await navigator.mediaDevices.getUserMedia({ audio: true });
-        // Permission granted — stop the test stream and start capture
-        permResult.getTracks().forEach((t) => t.stop());
-        capture.start();
+        await capture.start();
+        // If start() didn't throw but isCapturing is still false after a tick,
+        // the permission was denied (useAudioCapture returns early on denial).
+        // We use a microtask to let state update, but the hook logs internally.
       } catch {
         useErrorStore.getState().reportMicDenied();
       }

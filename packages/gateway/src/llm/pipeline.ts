@@ -18,6 +18,7 @@ export class LlmPipeline extends EventEmitter {
   private previousBufferLength: number = 0;
   private abortController: AbortController | null = null;
   private cancelled: boolean = false;
+  private activeTurnId: string | null = null;
 
   constructor(gateway: GatewayClient) {
     super();
@@ -30,12 +31,14 @@ export class LlmPipeline extends EventEmitter {
     this.previousBufferLength = 0;
     this.phraseChunker.reset();
     this.cancelled = false;
+    this.activeTurnId = turnId;
     this.abortController = new AbortController();
 
     const message = `[[voice]] Be brief.\n${text}`;
 
     try {
       await this.gateway.sendChat(sessionKey, message, {
+        signal: this.abortController.signal,
         onDelta: (fullBuffer: string, _payload: Record<string, unknown>) => {
           if (this.cancelled) return; // Stop processing deltas after cancel
 
@@ -70,6 +73,10 @@ export class LlmPipeline extends EventEmitter {
       if (!this.cancelled) {
         this.emit('error', { error: err, turnId });
       }
+    } finally {
+      // If the call completed naturally, release the controller.
+      this.abortController = null;
+      this.activeTurnId = null;
     }
   }
 
@@ -81,11 +88,13 @@ export class LlmPipeline extends EventEmitter {
       this.abortController.abort();
       this.abortController = null;
     }
-    // Flush remaining text from chunker
-    const remaining = this.phraseChunker.feed('', true);
-    for (const chunk of remaining) {
-      this.emit('phrase_ready', { text: chunk.text, index: chunk.index });
-    }
+
+    // Do NOT flush remaining text from the phrase chunker on cancel.
+    // Flushing would emit phrase_ready events that queue new TTS synthesis
+    // work — pointless since the TTS pipeline is also being cancelled.
+    this.phraseChunker.reset();
+
+    this.activeTurnId = null;
     this.emit('llm_done', { fullText: this.accumulatedText, cancelled: true });
   }
 }
