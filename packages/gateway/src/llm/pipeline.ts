@@ -17,6 +17,7 @@ export class LlmPipeline extends EventEmitter {
   private accumulatedText: string = '';
   private previousBufferLength: number = 0;
   private abortController: AbortController | null = null;
+  private cancelled: boolean = false;
 
   constructor(gateway: GatewayClient) {
     super();
@@ -28,6 +29,7 @@ export class LlmPipeline extends EventEmitter {
     this.accumulatedText = '';
     this.previousBufferLength = 0;
     this.phraseChunker.reset();
+    this.cancelled = false;
     this.abortController = new AbortController();
 
     const message = `[[voice]] Be brief.\n${text}`;
@@ -35,6 +37,8 @@ export class LlmPipeline extends EventEmitter {
     try {
       await this.gateway.sendChat(sessionKey, message, {
         onDelta: (fullBuffer: string, _payload: Record<string, unknown>) => {
+          if (this.cancelled) return; // Stop processing deltas after cancel
+
           // gateway-client calls onDelta with the full accumulated buffer,
           // so extract the actual new token from the difference
           const token = fullBuffer.substring(this.previousBufferLength);
@@ -52,6 +56,8 @@ export class LlmPipeline extends EventEmitter {
           }
         },
         onFinal: (finalText: string, _payload: Record<string, unknown>) => {
+          if (this.cancelled) return; // cancel() already emitted llm_done
+
           // Flush remaining text from chunker
           const remaining = this.phraseChunker.feed('', true);
           for (const chunk of remaining) {
@@ -61,11 +67,16 @@ export class LlmPipeline extends EventEmitter {
         },
       });
     } catch (err) {
-      this.emit('error', { error: err, turnId });
+      if (!this.cancelled) {
+        this.emit('error', { error: err, turnId });
+      }
     }
   }
 
   cancel(): void {
+    if (this.cancelled) return; // Prevent double-cancel
+    this.cancelled = true;
+
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;

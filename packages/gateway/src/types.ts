@@ -22,7 +22,7 @@ export type TurnState =
 export const VALID_TRANSITIONS: Record<TurnState, TurnState[]> = {
   idle: ['listening'],
   listening: ['transcribing', 'idle'],    // idle via barge-in cancel
-  transcribing: ['pending_send'],
+  transcribing: ['pending_send', 'idle'], // idle on empty transcript or STT error
   pending_send: ['thinking', 'idle'],     // idle via cancel
   thinking: ['speaking', 'idle'],         // idle via cancel
   speaking: ['idle', 'listening'],        // listening via barge-in

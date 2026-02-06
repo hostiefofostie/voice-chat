@@ -19,7 +19,6 @@ export class TtsPipeline extends EventEmitter {
   private completedAudio: Map<number, Buffer> = new Map();
   private inFlight: number = 0;
   private cancelled: boolean = false;
-  private totalChunks: number = -1; // -1 = unknown (streaming)
 
   constructor(options: TtsPipelineOptions) {
     super();
@@ -36,7 +35,6 @@ export class TtsPipeline extends EventEmitter {
   }
 
   async finish() {
-    this.totalChunks = this.pendingChunks.size + this.completedAudio.size + this.inFlight;
     await this.drainAll();
     if (!this.cancelled) {
       this.sendJson({ type: 'tts_done' });
@@ -58,7 +56,6 @@ export class TtsPipeline extends EventEmitter {
     this.nextSendIndex = 0;
     this.inFlight = 0;
     this.cancelled = false;
-    this.totalChunks = -1;
   }
 
   private async dispatch() {
@@ -93,9 +90,17 @@ export class TtsPipeline extends EventEmitter {
       const audio = this.completedAudio.get(this.nextSendIndex)!;
       this.completedAudio.delete(this.nextSendIndex);
 
-      // Parse WAV header for metadata
-      const sampleRate = audio.readUInt32LE(24);
-      const durationMs = Math.round((audio.length - 44) / (sampleRate * 2) * 1000);
+      // Parse WAV header for metadata (guard against malformed audio)
+      let sampleRate = 16000;
+      let durationMs = 0;
+      if (audio.length >= 44) {
+        sampleRate = audio.readUInt32LE(24) || 16000;
+        const dataSize = audio.length - 44;
+        const bytesPerSample = 2; // 16-bit
+        durationMs = sampleRate > 0
+          ? Math.round(dataSize / (sampleRate * bytesPerSample) * 1000)
+          : 0;
+      }
 
       this.sendJson({
         type: 'tts_meta',
@@ -111,14 +116,26 @@ export class TtsPipeline extends EventEmitter {
   }
 
   private drainAll(): Promise<void> {
+    const DRAIN_TIMEOUT_MS = 30_000;
     return new Promise((resolve) => {
+      const startedAt = Date.now();
       const check = () => {
+        if (this.cancelled) {
+          resolve();
+          return;
+        }
         if (this.inFlight === 0 && this.pendingChunks.size === 0) {
           this.sendInOrder();
           resolve();
-        } else {
-          setTimeout(check, 50);
+          return;
         }
+        if (Date.now() - startedAt > DRAIN_TIMEOUT_MS) {
+          // Safety timeout — don't hang forever if inFlight is stuck
+          this.sendInOrder();
+          resolve();
+          return;
+        }
+        setTimeout(check, 50);
       };
       check();
     });

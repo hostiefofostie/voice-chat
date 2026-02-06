@@ -27,6 +27,11 @@ export class TurnMachine extends EventEmitter {
     this.state = to;
     if (turnId) this.turnId = turnId;
 
+    // Clear turnId when returning to idle so next turn gets a fresh one
+    if (to === 'idle') {
+      this.turnId = null;
+    }
+
     // Generate new turnId on transition to listening
     if (to === 'listening' && !this.turnId) {
       this.turnId = crypto.randomUUID();

@@ -142,11 +142,11 @@ describe('TurnMachine', () => {
       expect(machine.currentState).toBe('listening');
     });
 
-    it('transcribing -> idle (invalid)', () => {
+    it('transcribing -> idle (valid for empty transcript/error)', () => {
       machine.transition('listening');
       machine.transition('transcribing');
-      expect(machine.transition('idle')).toBe(false);
-      expect(machine.currentState).toBe('transcribing');
+      expect(machine.transition('idle')).toBe(true);
+      expect(machine.currentState).toBe('idle');
     });
 
     it('transcribing -> thinking (skip)', () => {
@@ -330,14 +330,14 @@ describe('TurnMachine', () => {
       machine.transition('pending_send');
       machine.transition('idle');
 
-      // New listening cycle
+      // turnId should be cleared on idle transition
+      expect(machine.currentTurnId).toBeNull();
+
+      // New listening cycle gets a fresh turnId
       machine.transition('listening');
       const id2 = machine.currentTurnId;
-      // turnId from first cycle may persist since idle doesn't clear it
-      // but a new UUID is only generated if turnId is null
-      // After idle->listening the turnId is still set from the first cycle
-      // This is because the code only generates if !this.turnId
       expect(id2).toBeTruthy();
+      expect(id2).not.toBe(id1);
     });
   });
 

@@ -136,9 +136,8 @@ async function processAudioBuffer(
     if (!result.text || result.text.trim().length === 0) {
       // Empty transcript — go back to idle
       app.log.info({ connId: conn.id }, 'Empty transcript, returning to idle');
-      conn.turnState = 'idle';
       conn.turnId = null;
-      sendMessage(conn, { type: 'turn_state', state: 'idle' });
+      transitionState(conn, 'idle', app);
       return;
     }
 
@@ -157,9 +156,8 @@ async function processAudioBuffer(
       recoverable: true,
     });
     // Return to idle on STT failure
-    conn.turnState = 'idle';
     conn.turnId = null;
-    sendMessage(conn, { type: 'turn_state', state: 'idle' });
+    transitionState(conn, 'idle', app);
   }
 }
 
@@ -194,7 +192,9 @@ async function runLlmTtsPipeline(
       app.log.error({ connId: conn.id, err }, 'TTS chunk processing failed');
     });
   };
-  const onLlmDone = async ({ fullText }: { fullText: string; cancelled?: boolean }) => {
+  const onLlmDone = async ({ fullText, cancelled }: { fullText: string; cancelled?: boolean }) => {
+    if (cancelled) return; // cancel/barge-in handler manages state directly
+
     sendMessage(conn, { type: 'llm_done', fullText });
 
     // Finish TTS pipeline (wait for all queued chunks to complete)
@@ -229,21 +229,16 @@ async function runLlmTtsPipeline(
   conn.llmPipeline.on('llm_done', onLlmDone);
   conn.llmPipeline.on('error', onLlmError);
 
-  // Transition to speaking when first TTS audio is ready
-  conn.ttsPipeline.on('done', () => {
-    // TTS complete — handled in onLlmDone
-  });
+  // Transition to speaking state when first phrase goes to TTS
+  const oncePhrase = () => {
+    if (conn.turnState === 'thinking') {
+      transitionState(conn, 'speaking', app);
+    }
+    conn.llmPipeline.off('phrase_ready', oncePhrase);
+  };
+  conn.llmPipeline.on('phrase_ready', oncePhrase);
 
   try {
-    // Transition to speaking state when first phrase goes to TTS
-    const oncePhrase = () => {
-      if (conn.turnState === 'thinking') {
-        transitionState(conn, 'speaking', app);
-      }
-      conn.llmPipeline.off('phrase_ready', oncePhrase);
-    };
-    conn.llmPipeline.on('phrase_ready', oncePhrase);
-
     await conn.llmPipeline.sendTranscript(
       text,
       conn.config.sessionKey || 'default',
@@ -252,6 +247,7 @@ async function runLlmTtsPipeline(
   } finally {
     conn.llmPipeline.off('llm_token', onToken);
     conn.llmPipeline.off('phrase_ready', onPhraseReady);
+    conn.llmPipeline.off('phrase_ready', oncePhrase); // Clean up one-shot listener
     conn.llmPipeline.off('llm_done', onLlmDone);
     conn.llmPipeline.off('error', onLlmError);
   }
@@ -333,7 +329,7 @@ function handleJsonMessage(
       sendMessage(conn, { type: 'pong', ts: msg.ts, serverTs: Date.now() });
       break;
 
-    case 'transcript_send':
+    case 'transcript_send': {
       if (!conn.llmLimiter.check()) {
         sendMessage(conn, {
           type: 'error',
@@ -347,12 +343,19 @@ function handleJsonMessage(
         { connId: conn.id, turnId: msg.turnId, text: msg.text },
         'Received transcript_send',
       );
+      // Clear any pending silence timer to prevent double-processing
+      const pendingSilence = silenceTimers.get(conn.id);
+      if (pendingSilence) {
+        clearTimeout(pendingSilence);
+        silenceTimers.delete(conn.id);
+      }
       conn.turnId = msg.turnId;
       cleanup(conn); // Clear audio buffer since we have the final text
       runLlmTtsPipeline(conn, msg.text, msg.turnId, app).catch((err) => {
         app.log.error({ connId: conn.id, err }, 'LLM/TTS pipeline failed');
       });
       break;
+    }
 
     case 'command':
       app.log.info(
@@ -373,19 +376,27 @@ function handleJsonMessage(
       break;
 
     case 'barge_in':
-      // Stop TTS, transition to idle
+      // Stop TTS/LLM, transition to idle
       app.log.info({ connId: conn.id }, 'Barge-in received');
-      if (conn.turnState === 'speaking') {
-        conn.ttsPipeline.cancel();
+      if (conn.turnState === 'speaking' || conn.turnState === 'thinking') {
         conn.llmPipeline.cancel();
+        conn.ttsPipeline.cancel();
         conn.turnId = null;
-        transitionState(conn, 'idle', app);
+        // Force state to idle (bypass normal transition validation for barge-in)
+        conn.turnState = 'idle';
+        sendMessage(conn, { type: 'turn_state', state: 'idle' });
       }
       break;
 
-    case 'cancel':
+    case 'cancel': {
       // Abort current pipeline, transition to idle
       app.log.info({ connId: conn.id, state: conn.turnState }, 'Cancel received');
+      // Clear any pending silence timer
+      const cancelSilence = silenceTimers.get(conn.id);
+      if (cancelSilence) {
+        clearTimeout(cancelSilence);
+        silenceTimers.delete(conn.id);
+      }
       if (conn.turnState !== 'idle') {
         conn.llmPipeline.cancel();
         conn.ttsPipeline.cancel();
@@ -396,6 +407,7 @@ function handleJsonMessage(
         sendMessage(conn, { type: 'turn_state', state: 'idle' });
       }
       break;
+    }
 
     case 'config':
       // Merge partial config
@@ -487,6 +499,9 @@ export function registerWebSocket(app: FastifyInstance) {
 
     socket.on('close', () => {
       app.log.info({ connId: conn.id }, 'WebSocket disconnected');
+      // Cancel in-progress pipelines to prevent work on a dead connection
+      conn.llmPipeline.cancel();
+      conn.ttsPipeline.cancel();
       cleanup(conn);
       conn.messageLimiter.reset();
       conn.llmLimiter.reset();

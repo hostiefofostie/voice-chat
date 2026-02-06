@@ -48,6 +48,12 @@ export class SttRouter extends EventEmitter {
     this.usingFallback = true;
     this.emit('provider_switched', { from: 'parakeet', to: 'cloud_stub' });
 
+    // Clear any existing health check before starting a new one
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+
     // Start health checks to auto-recover
     this.healthCheckInterval = setInterval(async () => {
       if (await this.primary.healthCheck()) {
