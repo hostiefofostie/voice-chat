@@ -1,3 +1,6 @@
 .ntm/
 .voicechat-device.json
 *.pem
+
+# bv (beads viewer) local config and caches
+.bv/

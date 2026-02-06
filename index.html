@@ -52,8 +52,14 @@
     <form method="dialog" id="configForm" style="display:flex;flex-direction:column;gap:10px;min-width:320px">
       <h3 style="margin:0">Config</h3>
       <label>Session Key<input id="sessionKey" type="text" placeholder="main" style="width:100%"></label>
-      <label>TTS Voice<input id="voice" type="text" placeholder="cedar" style="width:100%"></label>
-      <label>TTS Instructions<textarea id="ttsInstructions" placeholder="e.g., Speak warmly, calm pace, slight smile."></textarea></label>
+      <label>TTS Provider
+        <select id="ttsProvider" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0b0e14;color:#e5e7eb">
+          <option value="openai">OpenAI</option>
+          <option value="kokoro">Kokoro (Local)</option>
+        </select>
+      </label>
+      <label>TTS Voice<select id="voice" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid #334155;background:#0b0e14;color:#e5e7eb"></select></label>
+      <label id="ttsInstructionsLabel">TTS Instructions<textarea id="ttsInstructions" placeholder="e.g., Speak warmly, calm pace, slight smile."></textarea></label>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
         <button id="cancelConfig" type="button" class="secondary">Cancel</button>
         <button id="saveConfig" type="submit">Save</button>
@@ -102,7 +108,7 @@
       // Disable chunked TTS; wait for the final reply and speak it as one piece.
       const STREAM_TTS_ON_DELTA = false;
       const TTS_CHUNK_MIN_CHARS = 18;
-      const config = { sessionKey:'main', voice:'cedar', instructions: DEFAULT_TTS_INSTRUCTIONS };
+      const config = { sessionKey:'main', voice:'cedar', instructions: DEFAULT_TTS_INSTRUCTIONS, ttsProvider:'openai' };
       let status='stopped', running=false, starting=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, isTtsFetching=false, speechEnabled=true, isRecording=false, isMuted=false, autoEndpointing=true, lastAudioUrl=null, autoplayPrimed=false, autoplayPrimeAudio=null;
       const audioQueue = [];
       const ttsQueue = [];
@@ -333,14 +339,81 @@
         updateEndpointUi();
       };
       const saveEndpointPref = () => localStorage.setItem('voice-chat-endpoint', autoEndpointing ? 'auto' : 'manual');
+      let voicesCache = {};
+      const fetchVoices = async (provider) => {
+        if (voicesCache[provider]) return voicesCache[provider];
+        try {
+          const resp = await fetch(`/api/tts/voices?provider=${provider}`);
+          if (!resp.ok) return [];
+          const data = await resp.json();
+          let voices = [];
+          if (provider === 'kokoro' && data.voices) {
+            // Kokoro returns voices grouped by language: { "English": [{name, id}, ...], ... }
+            if (typeof data.voices === 'object' && !Array.isArray(data.voices)) {
+              for (const [lang, list] of Object.entries(data.voices)) {
+                if (Array.isArray(list)) {
+                  for (const v of list) voices.push({ id: v.id || v.name || v, name: v.name || v.id || v, lang });
+                }
+              }
+            } else if (Array.isArray(data.voices)) {
+              voices = data.voices.map(v => typeof v === 'string' ? { id: v, name: v } : v);
+            }
+          } else if (Array.isArray(data.voices)) {
+            voices = data.voices.map(v => typeof v === 'string' ? { id: v, name: v } : v);
+          }
+          voicesCache[provider] = voices;
+          return voices;
+        } catch (err) {
+          console.warn('Failed to fetch voices', err);
+          return [];
+        }
+      };
+      const populateVoiceSelect = (voices, selectedVoice) => {
+        const select = $('voice');
+        select.innerHTML = '';
+        if (!voices.length) {
+          const opt = document.createElement('option');
+          opt.value = selectedVoice || '';
+          opt.textContent = selectedVoice || '(none)';
+          select.appendChild(opt);
+          return;
+        }
+        let lastLang = null;
+        let optgroup = null;
+        for (const v of voices) {
+          if (v.lang && v.lang !== lastLang) {
+            optgroup = document.createElement('optgroup');
+            optgroup.label = v.lang;
+            select.appendChild(optgroup);
+            lastLang = v.lang;
+          }
+          const opt = document.createElement('option');
+          opt.value = v.id;
+          opt.textContent = v.name || v.id;
+          if (v.id === selectedVoice) opt.selected = true;
+          (optgroup || select).appendChild(opt);
+        }
+        // If selectedVoice not found, select first
+        if (selectedVoice && !select.value) select.selectedIndex = 0;
+      };
+      const updateProviderUi = async (provider) => {
+        const instrLabel = $('ttsInstructionsLabel');
+        if (instrLabel) instrLabel.style.display = provider === 'kokoro' ? 'none' : '';
+        const voices = await fetchVoices(provider);
+        const defaultVoice = provider === 'kokoro' ? 'af_heart' : 'cedar';
+        const currentVoice = config.ttsProvider === provider ? (config.voice || defaultVoice) : defaultVoice;
+        populateVoiceSelect(voices, currentVoice);
+      };
       const fillConfigForm = () => {
         $('sessionKey').value = config.sessionKey || '';
-        $('voice').value = config.voice || '';
+        $('ttsProvider').value = config.ttsProvider || 'openai';
         if (ttsInstructions) ttsInstructions.value = config.instructions || '';
+        updateProviderUi(config.ttsProvider || 'openai');
       };
       const applyFormToConfig = () => {
         config.sessionKey = $('sessionKey').value.trim() || 'main';
-        config.voice = $('voice').value.trim() || 'cedar';
+        config.ttsProvider = $('ttsProvider').value || 'openai';
+        config.voice = $('voice').value.trim() || (config.ttsProvider === 'kokoro' ? 'af_heart' : 'cedar');
         config.instructions = (ttsInstructions?.value || '').trim();
       };
       const ensureConfig = async (force=false) => {
@@ -512,17 +585,16 @@
         if (audioCtx.state === 'suspended') await audioCtx.resume();
         window.audioCtx = audioCtx;
       };
-      const primeAutoplay = async () => {
+      const primeAutoplay = () => {
         if (autoplayPrimed) return;
         autoplayPrimed = true;
         try {
           const a = new Audio();
           autoplayPrimeAudio = a;
-          a.muted = true;
           a.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
-          await a.play();
-          a.pause();
-          a.muted = false;
+          // Synchronous play call within user gesture — don't await
+          const p = a.play();
+          if (p) p.then(() => { a.pause(); }).catch(() => {});
         } catch (err) {
           console.warn('Autoplay prime failed', err);
         }
@@ -563,6 +635,8 @@
       };
 
       const canStreamTts = () => {
+        // Kokoro returns WAV (not streamable via MediaSource); use buffer-based playback
+        if ((config.ttsProvider || 'openai') === 'kokoro') return false;
         if (!window.MediaSource || typeof MediaSource.isTypeSupported !== 'function') return false;
         const mime = 'audio/mpeg';
         const audioOk = !!document.createElement('audio').canPlayType(mime);
@@ -574,8 +648,8 @@
       };
 
       const streamTtsPlayback = async (text, timing, requestId, controller) => {
-        const payload = { text, voice: config.voice };
-        if (config.instructions) payload.instructions = config.instructions;
+        const payload = { text, voice: config.voice, provider: config.ttsProvider || 'openai' };
+        if (config.ttsProvider !== 'kokoro' && config.instructions) payload.instructions = config.instructions;
         const response = await fetch('/api/tts/stream', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
@@ -726,8 +800,8 @@
             }
           }
 
-          const payload = { text, voice: config.voice };
-          if (config.instructions) payload.instructions = config.instructions;
+          const payload = { text, voice: config.voice, provider: config.ttsProvider || 'openai' };
+          if (config.ttsProvider !== 'kokoro' && config.instructions) payload.instructions = config.instructions;
           const response = await fetch('/api/tts', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
@@ -741,7 +815,8 @@
           const arrayBuffer = await response.arrayBuffer();
           if (currentTtsRequestId !== requestId) return;
           try { if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl); } catch {}
-          const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+          const mimeType = (config.ttsProvider || 'openai') === 'kokoro' ? 'audio/wav' : 'audio/mpeg';
+          const blob = new Blob([arrayBuffer], { type: mimeType });
           const url = URL.createObjectURL(blob);
           lastAudioUrl = url;
           // replyAudio element removed
@@ -1006,6 +1081,8 @@
         if (running || starting) return;
         starting = true;
         startBtn.disabled = true;
+        // Prime autoplay IMMEDIATELY in click handler — before any awaits
+        primeAutoplay();
         setStatus('listening', 'Starting...');
         try {
           const ok = await ensureConfig();
@@ -1136,6 +1213,7 @@
           speechToggle.textContent = speechEnabled ? 'Speech: On' : 'Speech: Off';
           saveSpeechPref();
           if (speechEnabled) {
+            primeAutoplay();
             try { await ensureAudioContext(); audioUnlocked = true; } catch {}
             await tryPlayTts();
           } else {
@@ -1154,6 +1232,9 @@
       }
       configBtn.addEventListener('click', () => { loadConfig(); fillConfigForm(); configDialog.showModal(); });
       cancelConfig.addEventListener('click', () => configDialog.close());
+      $('ttsProvider').addEventListener('change', (e) => {
+        updateProviderUi(e.target.value);
+      });
       configForm.addEventListener('submit', (e) => {
         e.preventDefault();
         applyFormToConfig();

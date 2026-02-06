@@ -18,6 +18,7 @@ const { Readable } = require('stream');
 const PORT = Number(process.env.VOICE_BRIDGE_PORT || 8787);
 const PARKEET_URL = process.env.PARAKEET_URL || 'http://100.86.69.14:8765';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.VOICECHAT_OPENAI_API_KEY || '';
+const KOKORO_URL = process.env.KOKORO_URL || 'http://100.86.69.14:8787';
 
 const GATEWAY_URL = process.env.VOICECHAT_GATEWAY_URL || 'ws://127.0.0.1:18789/gateway';
 const GATEWAY_TOKEN = process.env.VOICECHAT_GATEWAY_TOKEN || process.env.OPENCLAW_GATEWAY_TOKEN || '';
@@ -654,8 +655,29 @@ const handleChatStream = async (req, res) => {
 
 const handleTts = async (req, res) => {
   const t0 = Date.now();
-  const { text, voice, instructions } = await readJson(req);
+  const { text, voice, instructions, provider } = await readJson(req);
   if (!text || !text.trim()) return json(res, 400, { error: 'text required' });
+
+  if (provider === 'kokoro') {
+    const resp = await fetch(`${KOKORO_URL}/api/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice: voice || 'af_heart' })
+    });
+    const t1 = Date.now();
+    if (!resp.ok) {
+      const textErr = await resp.text().catch(() => '');
+      console.log(`[tts-kokoro] ${t1 - t0}ms error ${resp.status}`);
+      return json(res, resp.status, { error: `Kokoro TTS error (${resp.status})`, detail: textErr });
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    console.log(`[tts-kokoro] ${t1 - t0}ms ok`);
+    res.writeHead(200, { 'Content-Type': 'audio/wav' });
+    res.end(buf);
+    return;
+  }
+
+  // Default: OpenAI
   if (!OPENAI_API_KEY) return json(res, 500, { error: 'OPENAI_API_KEY not set on bridge server' });
   const resp = await fetch('https://api.openai.com/v1/audio/speech', {
     method: 'POST',
@@ -685,8 +707,30 @@ const handleTts = async (req, res) => {
 
 const handleTtsStream = async (req, res) => {
   const t0 = Date.now();
-  const { text, voice, instructions } = await readJson(req);
+  const { text, voice, instructions, provider } = await readJson(req);
   if (!text || !text.trim()) return json(res, 400, { error: 'text required' });
+
+  if (provider === 'kokoro') {
+    // Kokoro doesn't support streaming; return full WAV response
+    const resp = await fetch(`${KOKORO_URL}/api/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice: voice || 'af_heart' })
+    });
+    const t1 = Date.now();
+    if (!resp.ok) {
+      const textErr = await resp.text().catch(() => '');
+      console.log(`[tts-stream-kokoro] ${t1 - t0}ms error ${resp.status}`);
+      return json(res, resp.status, { error: `Kokoro TTS error (${resp.status})`, detail: textErr });
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    console.log(`[tts-stream-kokoro] ${t1 - t0}ms ok`);
+    res.writeHead(200, { 'Content-Type': 'audio/wav' });
+    res.end(buf);
+    return;
+  }
+
+  // Default: OpenAI
   if (!OPENAI_API_KEY) return json(res, 500, { error: 'OPENAI_API_KEY not set on bridge server' });
 
   const resp = await fetch('https://api.openai.com/v1/audio/speech', {
@@ -739,6 +783,56 @@ const handleTtsStream = async (req, res) => {
   }
 };
 
+const OPENAI_VOICES = [
+  'alloy', 'ash', 'ballad', 'cedar', 'coral', 'echo', 'fable', 'nova', 'onyx', 'sage', 'shimmer', 'verse'
+];
+
+const handleTtsVoices = async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const provider = url.searchParams.get('provider') || 'openai';
+
+  if (provider === 'kokoro') {
+    try {
+      const resp = await fetch(`${KOKORO_URL}/api/voices`);
+      if (!resp.ok) {
+        const textErr = await resp.text().catch(() => '');
+        return json(res, resp.status, { error: `Kokoro voices error (${resp.status})`, detail: textErr });
+      }
+      const data = await resp.json();
+      return json(res, 200, { provider: 'kokoro', voices: data.voices || data });
+    } catch (err) {
+      return json(res, 502, { error: 'Failed to reach Kokoro', detail: String(err?.message || err) });
+    }
+  }
+
+  // Default: OpenAI
+  return json(res, 200, { provider: 'openai', voices: OPENAI_VOICES });
+};
+
+const handleTtsHealth = async (_req, res) => {
+  const results = { openai: { ok: false }, kokoro: { ok: false } };
+
+  // Check OpenAI
+  results.openai.ok = !!OPENAI_API_KEY;
+  results.openai.configured = !!OPENAI_API_KEY;
+
+  // Check Kokoro
+  try {
+    const resp = await fetch(`${KOKORO_URL}/health`, { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) {
+      results.kokoro.ok = true;
+      try { results.kokoro.detail = await resp.json(); } catch {}
+    } else {
+      results.kokoro.error = `HTTP ${resp.status}`;
+    }
+  } catch (err) {
+    results.kokoro.error = String(err?.message || err);
+  }
+  results.kokoro.url = KOKORO_URL;
+
+  return json(res, 200, results);
+};
+
 const handleHealth = async (_req, res) => {
   json(res, 200, {
     ok: true,
@@ -756,6 +850,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/transcribe') return await handleTranscribe(req, res);
     if (req.method === 'POST' && url.pathname === '/api/chat') return await handleChat(req, res);
     if (req.method === 'POST' && url.pathname === '/api/chat/stream') return await handleChatStream(req, res);
+    if (req.method === 'GET' && url.pathname === '/api/tts/voices') return await handleTtsVoices(req, res);
+    if (req.method === 'GET' && url.pathname === '/api/tts/health') return await handleTtsHealth(req, res);
     if (req.method === 'POST' && url.pathname === '/api/tts') return await handleTts(req, res);
     if (req.method === 'POST' && url.pathname === '/api/tts/stream') return await handleTtsStream(req, res);
     res.writeHead(404, { 'Content-Type': 'application/json' });
