@@ -28,8 +28,16 @@ import type { ServerMessage } from '../lib/types';
 // Constants
 // ---------------------------------------------------------------------------
 
-const GATEWAY_URL =
-  process.env.EXPO_PUBLIC_GATEWAY_URL ?? 'ws://localhost:8788/ws';
+const GATEWAY_URL = (() => {
+  const env = process.env.EXPO_PUBLIC_GATEWAY_URL;
+  if (env) return env;
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const host = window.location.hostname;
+    const secure = window.location.protocol === 'https:';
+    return `${secure ? 'wss' : 'ws'}://${host}:8788/ws`;
+  }
+  return 'ws://localhost:8788/ws';
+})();
 
 // ---------------------------------------------------------------------------
 // Main Screen
@@ -215,8 +223,18 @@ export default function Index() {
         reconcile('listening');
       } else if (currentState === 'idle') {
         transition('listening');
+      } else if (
+        currentState === 'pending_send' ||
+        currentState === 'transcribing' ||
+        currentState === 'listening'
+      ) {
+        // User resumed speaking mid-turn — don't cancel, just go back to listening.
+        // The server will accumulate the transcript across segments.
+        // `listening` can appear here when a server turn_state message arrives
+        // between VAD speech segments (race between server reconcile and VAD events).
+        reconcile('listening');
       } else {
-        // Speaking during thinking/transcribing/pending_send — cancel and restart
+        // Speaking during thinking — cancel and restart
         wsRef.current?.send({ type: 'cancel' });
         reconcile('listening');
       }
@@ -246,37 +264,86 @@ export default function Index() {
     }
   }, [capture]);
 
-  // ---- Send transcript (from TranscriptBox or text input) ----
-  const handleSendTranscript = useCallback(
-    (text: string) => {
-      const turnId =
-        useTurnStore.getState().turnId ?? crypto.randomUUID();
+  // ---- Countdown for auto-send ----
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const autoSendDelayMs = useTurnStore((s) => s.autoSendDelayMs);
+
+  // When entering pending_send, populate the text input with the transcript
+  const transcript = useTurnStore((s) => s.transcript);
+  useEffect(() => {
+    if (turnState === 'pending_send' && transcript) {
+      setTextInput(transcript);
+      const asd = useConfigStore.getState().autoSendDisabled;
+      const delay = useTurnStore.getState().autoSendDelayMs;
+      if (!asd && delay > 0) {
+        setCountdown(Math.ceil(delay / 1000));
+      } else {
+        setCountdown(null);
+      }
+    } else if (turnState !== 'pending_send') {
+      setCountdown(null);
+    }
+  }, [turnState, transcript]);
+
+  // Countdown timer tick
+  useEffect(() => {
+    if (turnState !== 'pending_send' || countdown === null || countdown <= 0) return;
+    const timer = setTimeout(() => {
+      setCountdown((c) => (c !== null ? c - 1 : null));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [countdown, turnState]);
+
+  // Auto-send when countdown reaches 0
+  const textInputRef = useRef(textInput);
+  textInputRef.current = textInput;
+  useEffect(() => {
+    if (countdown === 0 && turnState === 'pending_send') {
+      const text = textInputRef.current.trim();
+      if (!text) return;
+      const turnId = useTurnStore.getState().turnId ?? crypto.randomUUID();
       addMessage({ role: 'user', text });
       ws.send({ type: 'transcript_send', text, turnId });
-      // Use reconcile for optimistic UI — transition() would fail from
-      // idle->thinking since it's not a valid step in the state machine.
-      // Server will send authoritative turn_state messages.
       reconcile('thinking', turnId);
-    },
-    [addMessage, ws, reconcile],
-  );
+      setTextInput('');
+    }
+  }, [countdown, turnState, addMessage, ws, reconcile]);
 
-  const handleCancelTranscript = useCallback(() => {
-    ws.send({ type: 'cancel' });
-    resetTurn();
-    useErrorStore.getState().reportLlmDone();
-  }, [ws, resetTurn]);
-
-  // ---- Text input send ----
-  const handleTextSend = useCallback(() => {
+  // ---- Unified send handler (works for both typed text and pending transcript) ----
+  const handleSend = useCallback(() => {
     const text = textInput.trim();
     if (!text) return;
-    const turnId = crypto.randomUUID();
+    // In pending_send, use the existing turnId; otherwise create a new one
+    const turnId =
+      turnState === 'pending_send'
+        ? (useTurnStore.getState().turnId ?? crypto.randomUUID())
+        : crypto.randomUUID();
     addMessage({ role: 'user', text });
     ws.send({ type: 'transcript_send', text, turnId });
     reconcile('thinking', turnId);
     setTextInput('');
-  }, [textInput, addMessage, ws, reconcile]);
+    setCountdown(null);
+  }, [textInput, turnState, addMessage, ws, reconcile]);
+
+  const handleCancelTranscript = useCallback(() => {
+    ws.send({ type: 'cancel' });
+    resetTurn();
+    setTextInput('');
+    setCountdown(null);
+    useErrorStore.getState().reportLlmDone();
+  }, [ws, resetTurn]);
+
+  // Reset countdown when user edits text during pending_send
+  const handleTextChange = useCallback((text: string) => {
+    setTextInput(text);
+    if (useTurnStore.getState().state === 'pending_send') {
+      const asd = useConfigStore.getState().autoSendDisabled;
+      const delay = useTurnStore.getState().autoSendDelayMs;
+      if (!asd && delay > 0) {
+        setCountdown(Math.ceil(delay / 1000));
+      }
+    }
+  }, []);
 
   // ---- LLM retry: resend the last user message ----
   const handleRetryLlm = useCallback(() => {
@@ -308,13 +375,15 @@ export default function Index() {
     }
   }, [capture]);
 
+  // ---- Auto-send toggle ----
+  const autoSendDisabled = useConfigStore((s) => s.autoSendDisabled);
+  const toggleAutoSend = useConfigStore((s) => s.toggleAutoSend);
+
   // ---- Determine visibility ----
   const voiceDisabled =
     errors.wsDisconnected || errors.textOnlyMode;
-  const showTextInput =
-    turnState === 'idle' && (!capture.isCapturing || voiceDisabled);
-  const showTranscriptBox =
-    turnState === 'transcribing' || turnState === 'pending_send';
+  const showTranscriptBox = turnState === 'transcribing';
+  const isPendingSend = turnState === 'pending_send';
   const isThinking = turnState === 'thinking';
 
   return (
@@ -361,47 +430,70 @@ export default function Index() {
       {/* Chat History */}
       <ChatHistory />
 
-      {/* Transcript Box (transcribing / pending_send) */}
-      {showTranscriptBox && (
-        <TranscriptBox
-          onSend={handleSendTranscript}
-          onCancel={handleCancelTranscript}
-        />
-      )}
+      {/* Transcript Box (transcribing only — live partial transcript) */}
+      {showTranscriptBox && <TranscriptBox />}
 
-      {/* Text Input (idle, or voice disabled) */}
-      {showTextInput && (
-        <View style={styles.textInputRow}>
-          <TextInput
-            style={styles.textInput}
-            value={textInput}
-            onChangeText={setTextInput}
-            placeholder={
-              errors.textOnlyMode
-                ? 'Voice unavailable — type your message...'
-                : 'Type a message...'
-            }
-            placeholderTextColor="#6b7280"
-            returnKeyType="send"
-            onSubmitEditing={handleTextSend}
-            editable={ws.isConnected}
-          />
-          <Pressable
-            onPress={handleTextSend}
-            style={[
-              styles.textSendBtn,
-              (!textInput.trim() || !ws.isConnected) && styles.textSendBtnDisabled,
-            ]}
-            disabled={!textInput.trim() || !ws.isConnected}
-          >
-            <Text style={styles.textSendText}>Send</Text>
+      {/* Persistent text input — also used for editing transcripts in pending_send */}
+      <View style={styles.textInputRow}>
+        <TextInput
+          style={[
+            styles.textInput,
+            isPendingSend && styles.textInputPending,
+          ]}
+          value={textInput}
+          onChangeText={handleTextChange}
+          placeholder={
+            errors.textOnlyMode
+              ? 'Voice unavailable — type your message...'
+              : 'Type a message...'
+          }
+          placeholderTextColor="#6b7280"
+          returnKeyType="send"
+          onSubmitEditing={handleSend}
+          editable={ws.isConnected}
+          multiline
+          blurOnSubmit
+        />
+        {countdown !== null && countdown > 0 && (
+          <Text style={styles.countdown}>{countdown}</Text>
+        )}
+        <Pressable
+          onPress={handleSend}
+          style={[
+            styles.textSendBtn,
+            (!textInput.trim() || !ws.isConnected) && styles.textSendBtnDisabled,
+          ]}
+          disabled={!textInput.trim() || !ws.isConnected}
+        >
+          <Text style={styles.textSendText}>Send</Text>
+        </Pressable>
+        {isPendingSend && (
+          <Pressable onPress={handleCancelTranscript} style={styles.cancelBtn} hitSlop={4}>
+            <Text style={styles.cancelText}>{'\u2715'}</Text>
           </Pressable>
-        </View>
-      )}
+        )}
+      </View>
 
       {/* Voice controls — hidden when voice is disabled */}
       {!voiceDisabled && (
         <View style={styles.controlsRow}>
+          <Pressable
+            onPress={toggleAutoSend}
+            style={[
+              styles.autoSendBtn,
+              autoSendDisabled && styles.autoSendBtnOff,
+            ]}
+            hitSlop={6}
+          >
+            <Text
+              style={[
+                styles.autoSendLabel,
+                autoSendDisabled && styles.autoSendLabelOff,
+              ]}
+            >
+              Auto
+            </Text>
+          </Pressable>
           <VoiceButton
             isCapturing={capture.isCapturing}
             isMuted={capture.isMuted}
@@ -422,6 +514,9 @@ const styles = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: '#0f1115',
+    maxWidth: 720,
+    width: '100%',
+    alignSelf: 'center',
   },
   header: {
     flexDirection: 'row',
@@ -480,6 +575,16 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#1e293b',
   },
+  textInputPending: {
+    borderColor: '#3b82f6',
+  },
+  countdown: {
+    color: '#6b7280',
+    fontSize: 13,
+    fontVariant: ['tabular-nums'],
+    minWidth: 16,
+    textAlign: 'center',
+  },
   textSendBtn: {
     backgroundColor: '#3b82f6',
     borderRadius: 10,
@@ -494,9 +599,45 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
   },
+  cancelBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#1e293b',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cancelText: {
+    color: '#9ca3af',
+    fontSize: 16,
+  },
   controlsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 16,
     borderTopWidth: 1,
     borderTopColor: '#1e293b',
     backgroundColor: '#0f1115',
+  },
+  autoSendBtn: {
+    backgroundColor: '#22c55e20',
+    borderWidth: 1,
+    borderColor: '#22c55e',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  autoSendBtnOff: {
+    backgroundColor: 'transparent',
+    borderColor: '#374151',
+  },
+  autoSendLabel: {
+    color: '#22c55e',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  autoSendLabelOff: {
+    color: '#6b7280',
   },
 });
