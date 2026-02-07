@@ -5,7 +5,6 @@ Building a voice chat app (React Native Expo Web + Fastify backend) for talking 
 
 ## Spec
 - Full spec: `REIMAGINE.md` (373 lines) — the source of truth
-- Original spec (V0): `SPEC.md` (reference only)
 
 ## Beads
 All tasks are tracked as beads. Use `bd` CLI:

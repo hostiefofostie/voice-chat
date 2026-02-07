@@ -106,15 +106,12 @@ voice-chat/
 ├── parakeet-server/             # Local STT server (Python/FastAPI)
 │   ├── server.py
 │   └── requirements.txt
-├── bridge.js                    # Legacy: original single-file Node backend
-├── index.html                   # Legacy: original single-file web UI
 ├── ecosystem.config.js          # PM2 production config
 ├── scripts/
 │   ├── build.sh
-│   └── deploy.sh
-├── REIMAGINE.md                 # Architecture spec
-├── SPEC.md                      # Original spec
-└── SWARM_REPORT.md              # Build report
+│   ├── deploy.sh
+│   └── https-proxy.mjs         # HTTPS reverse proxy for Expo dev
+└── REIMAGINE.md                 # Architecture spec
 ```
 
 ## Prerequisites
@@ -320,6 +317,3 @@ npm run logs      # pm2 logs voice-gateway
 
 PM2 config: single instance, 512MB memory limit, logs in `./logs/`.
 
-## Legacy
-
-The root-level `bridge.js` and `index.html` are the original single-file prototype — a vanilla JS frontend served over HTTPS with a Node HTTP bridge server proxying to Parakeet, OpenAI TTS, and OpenClaw. It works but is unmaintained. The monorepo packages are the active codebase.

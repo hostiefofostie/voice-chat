@@ -1,1 +1,0 @@
-I’ll read `REIMAGINE.md` in full and then skim `index.html` and `bridge.js` to ground the plan in the current V0 behavior before proposing concrete spec changes.
