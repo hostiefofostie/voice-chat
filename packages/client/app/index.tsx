@@ -251,6 +251,8 @@ export default function Index() {
     if (capture.isCapturing) {
       capture.stop();
     } else {
+      // Warm up AudioContext during this user gesture so TTS playback works later
+      try { await playback.warmup(); } catch {}
       // Start capture directly — useAudioCapture already handles getUserMedia
       // and logs permission denial. We catch here to report it to the error store.
       try {
@@ -313,6 +315,8 @@ export default function Index() {
   const handleSend = useCallback(() => {
     const text = textInput.trim();
     if (!text) return;
+    // Warm up AudioContext on user gesture so TTS playback works
+    playback.warmup().catch(() => {});
     // In pending_send, use the existing turnId; otherwise create a new one
     const turnId =
       turnState === 'pending_send'

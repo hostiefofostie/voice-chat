@@ -266,5 +266,11 @@ export function useAudioPlayback(options: {
     };
   }, []);
 
-  return { isPlaying, queueChunk, markDone, stop, setVolume };
+  /** Warm up AudioContext during a user gesture so playback works later. */
+  const warmup = useCallback(async () => {
+    const ctx = ensureContext();
+    await resumeContext(ctx);
+  }, [ensureContext, resumeContext]);
+
+  return { isPlaying, queueChunk, markDone, stop, setVolume, warmup };
 }
