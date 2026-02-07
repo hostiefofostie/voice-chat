@@ -222,6 +222,9 @@
       const tryPlayTts = async () => {
         if (!speechEnabled) return;
         try { await ensureAudioContext(); } catch {}
+        if (audioCtx?.state === 'suspended') {
+          try { await audioCtx.resume(); } catch {}
+        }
         audioUnlocked = audioCtx?.state === 'running';
         if (!audioUnlocked) {
           if (unlockBtn) unlockBtn.style.display = 'inline-block';
