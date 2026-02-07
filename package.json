@@ -8,6 +8,7 @@
   "scripts": {
     "dev:gateway": "npm run dev --workspace=@voice-chat/gateway",
     "dev:client": "npm run dev --workspace=@voice-chat/client",
+    "dev:https-proxy": "node scripts/https-proxy.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
     "start": "pm2 start ecosystem.config.js",

@@ -10,6 +10,7 @@ interface ChatMessage {
 interface ChatStore {
   messages: ChatMessage[];
   addMessage: (msg: Omit<ChatMessage, 'id' | 'timestamp'>) => void;
+  setMessages: (msgs: Array<{ role: 'user' | 'assistant'; text: string; timestamp?: number }>) => void;
   updateLastAssistant: (text: string) => void;
   clear: () => void;
 }
@@ -23,6 +24,14 @@ export const useChatStore = create<ChatStore>((set) => ({
       timestamp: Date.now(),
     }]
   })),
+  setMessages: (msgs) => set({
+    messages: msgs.map((m) => ({
+      id: crypto.randomUUID(),
+      role: m.role,
+      text: m.text,
+      timestamp: m.timestamp ?? Date.now(),
+    })),
+  }),
   updateLastAssistant: (text) => set(state => {
     const lastIdx = state.messages.findLastIndex(m => m.role === 'assistant');
     if (lastIdx === -1) return state;

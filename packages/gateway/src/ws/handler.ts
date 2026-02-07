@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { WebSocket, RawData } from 'ws';
 import {
+  ChatHistoryMessage,
   ClientMessage,
   ServerMessage,
   SessionConfig,
@@ -12,7 +13,7 @@ import { executeCommand } from './commands.js';
 import { SlidingWindowRateLimiter } from './rate-limiter.js';
 import { ParakeetClient } from '../stt/parakeet-client.js';
 import { SttRouter } from '../stt/router.js';
-import { GatewayClient } from '../llm/gateway-client.js';
+import { GatewayClient, extractText } from '../llm/gateway-client.js';
 import { LlmPipeline } from '../llm/pipeline.js';
 import { KokoroClient } from '../tts/kokoro-client.js';
 import { OpenAiTtsClient } from '../tts/openai-client.js';
@@ -31,6 +32,8 @@ interface ConnectionState {
   turnId: string | null;
   audioBuffer: Buffer[];
   audioBufferBytes: number;
+  /** Accumulated transcript text across speech segments within a single turn. */
+  pendingTranscript: string;
   connectedAt: number;
   lastPingAt: number;
   messageLimiter: SlidingWindowRateLimiter;
@@ -39,12 +42,15 @@ interface ConnectionState {
   llmPipeline: LlmPipeline;
   ttsPipeline: TtsPipeline;
   gatewayClient: GatewayClient;
+  lastHydratedSessionKey: string | null;
 }
 
 const MAX_AUDIO_BUFFER_BYTES = 10 * 1024 * 1024; // 10 MB
 const RATE_LIMIT_MSG_PER_SEC = 100;
 const RATE_LIMIT_LLM_PER_MIN = 30;
 const KEEPALIVE_INTERVAL_MS = 30_000;
+const DEFAULT_SESSION_KEY = 'main';
+const CHAT_HISTORY_LIMIT = 120;
 
 // Audio-silence timeout: if no new audio arrives for this long during
 // LISTENING, auto-transition to transcribing.
@@ -102,6 +108,102 @@ function sendBinary(conn: ConnectionState, data: Buffer) {
 function cleanup(conn: ConnectionState) {
   conn.audioBuffer = [];
   conn.audioBufferBytes = 0;
+  conn.pendingTranscript = '';
+}
+
+function normalizeSessionKey(raw: unknown): string {
+  if (typeof raw !== 'string') return DEFAULT_SESSION_KEY;
+  const trimmed = raw.trim();
+  return trimmed || DEFAULT_SESSION_KEY;
+}
+
+function parseHistoryMessages(payload: Record<string, unknown> | undefined): ChatHistoryMessage[] {
+  if (!payload) return [];
+
+  const fromPayload = payload['messages'];
+  if (!Array.isArray(fromPayload)) return [];
+
+  const out: ChatHistoryMessage[] = [];
+  for (const item of fromPayload) {
+    if (!item || typeof item !== 'object') continue;
+    const msg = item as Record<string, unknown>;
+    const roleRaw = msg['role'];
+    if (roleRaw !== 'user' && roleRaw !== 'assistant') continue;
+
+    const text = extractText(msg['content'] ?? msg['text'] ?? msg);
+    const cleaned = text.trim();
+    if (!cleaned) continue;
+
+    const timestamp = typeof msg['timestamp'] === 'number' ? msg['timestamp'] : undefined;
+    out.push({ role: roleRaw, text: cleaned, timestamp });
+  }
+
+  // OpenClaw chat.history returns newest-first; UI wants chronological.
+  return out.reverse();
+}
+
+async function hydrateChatHistory(conn: ConnectionState, app: FastifyInstance): Promise<void> {
+  const sessionKey = normalizeSessionKey(conn.config.sessionKey);
+
+  // Avoid redundant fetches for the same active session key.
+  if (conn.lastHydratedSessionKey === sessionKey) return;
+
+  try {
+    const payload = await conn.gatewayClient.sendRequest('chat.history', {
+      sessionKey,
+      limit: CHAT_HISTORY_LIMIT,
+    });
+
+    const messages = parseHistoryMessages(payload);
+    conn.lastHydratedSessionKey = sessionKey;
+
+    sendMessage(conn, {
+      type: 'chat_history',
+      sessionKey,
+      messages,
+    });
+
+    app.log.info(
+      { connId: conn.id, sessionKey, count: messages.length },
+      'Hydrated chat history',
+    );
+  } catch (err) {
+    app.log.warn(
+      { connId: conn.id, sessionKey, err },
+      'Failed to hydrate chat history',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// STT Output Cleaning
+// ---------------------------------------------------------------------------
+
+/** Strip STT artefacts like `<unk>` tokens that Parakeet emits for noise. */
+function cleanSttText(raw: string): string {
+  return raw.replace(/<unk>/gi, '').replace(/\s{2,}/g, ' ').trim();
+}
+
+/** Common filler/noise tokens that Parakeet emits for non-speech audio. */
+const NOISE_TOKENS = new Set([
+  'm', 'mm', 'mmm', 'mhm', 'hm', 'hmm', 'hn',
+  'uh', 'um', 'ah', 'oh', 'eh', 'er',
+]);
+
+/**
+ * Detect if a cleaned STT segment is likely noise (cough, throat clear, etc.)
+ * rather than intentional speech. Returns true if the segment should be discarded.
+ */
+function isNoisySegment(text: string): boolean {
+  if (!text) return true;
+  const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return true;
+  // All words are known noise tokens (e.g. "Hmm uh mm")
+  if (words.every((w) => NOISE_TOKENS.has(w))) return true;
+  // Same short token repeated 2+ times (e.g. "M M M M M")
+  const unique = new Set(words);
+  if (unique.size === 1 && words.length >= 2 && words[0].length <= 3) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,7 +227,9 @@ async function processAudioBuffer(
 
   try {
     const audioData = Buffer.concat(conn.audioBuffer);
-    cleanup(conn);
+    // Clear buffer but preserve pendingTranscript — we may append to it
+    conn.audioBuffer = [];
+    conn.audioBufferBytes = 0;
 
     const result = await conn.sttRouter.transcribe(audioData);
     app.log.info(
@@ -133,17 +237,77 @@ async function processAudioBuffer(
       'Transcription complete',
     );
 
-    if (!result.text || result.text.trim().length === 0) {
-      // Empty transcript — go back to idle
+    // Strip STT artefacts (<unk> tokens from Parakeet on noise/coughs)
+    const cleaned = cleanSttText(result.text ?? '');
+    const noisy = isNoisySegment(cleaned);
+    const newSegment = noisy ? '' : cleaned;
+    app.log.info(
+      { connId: conn.id, raw: result.text, cleaned, noisy, kept: newSegment },
+      'STT cleaned',
+    );
+
+    // Combine with any previously accumulated transcript
+    const combined = conn.pendingTranscript
+      ? newSegment
+        ? `${conn.pendingTranscript} ${newSegment}`
+        : conn.pendingTranscript
+      : newSegment;
+
+    if (!combined) {
+      // Empty transcript and no prior accumulation — go back to idle
       app.log.info({ connId: conn.id }, 'Empty transcript, returning to idle');
+      conn.pendingTranscript = '';
       conn.turnId = null;
       transitionState(conn, 'idle', app);
       return;
     }
 
+    // If the new segment was empty/noisy (VAD misfire) but we have
+    // prior accumulated text, return to pending_send without overwriting.
+    if (!newSegment && conn.pendingTranscript) {
+      app.log.info({ connId: conn.id }, 'Noisy/empty segment (misfire), keeping existing transcript');
+      sendMessage(conn, {
+        type: 'transcript_final',
+        text: conn.pendingTranscript,
+        turnId,
+      });
+      transitionState(conn, 'pending_send', app);
+      return;
+    }
+
+    // If new audio arrived while STT was running, save the accumulated
+    // transcript and go back to listening for the next segment.
+    if (conn.audioBufferBytes > 0) {
+      conn.pendingTranscript = combined;
+      app.log.info(
+        { connId: conn.id, pendingTranscript: combined },
+        'New audio arrived during STT, returning to listening',
+      );
+      transitionState(conn, 'listening', app);
+      // Reset silence timer for the newly buffered audio
+      const existing = silenceTimers.get(conn.id);
+      if (existing) clearTimeout(existing);
+      silenceTimers.set(
+        conn.id,
+        setTimeout(() => {
+          silenceTimers.delete(conn.id);
+          if (conn.turnState === 'listening' && conn.audioBufferBytes > 0) {
+            processAudioBuffer(conn, app).catch((err) => {
+              app.log.error({ connId: conn.id, err }, 'Audio processing failed');
+            });
+          }
+        }, AUDIO_SILENCE_TIMEOUT_MS),
+      );
+      return;
+    }
+
+    // No new audio — send the combined transcript and move to pending_send.
+    // Keep pendingTranscript set so if the user resumes speaking during
+    // pending_send, the next STT result will append to it.
+    conn.pendingTranscript = combined;
     sendMessage(conn, {
       type: 'transcript_final',
-      text: result.text,
+      text: combined,
       turnId,
     });
     transitionState(conn, 'pending_send', app);
@@ -156,6 +320,7 @@ async function processAudioBuffer(
       recoverable: true,
     });
     // Return to idle on STT failure
+    conn.pendingTranscript = '';
     conn.turnId = null;
     transitionState(conn, 'idle', app);
   }
@@ -251,7 +416,7 @@ async function runLlmTtsPipeline(
   try {
     await conn.llmPipeline.sendTranscript(
       text,
-      conn.config.sessionKey || 'default',
+      normalizeSessionKey(conn.config.sessionKey),
       turnId,
     );
   } finally {
@@ -282,7 +447,18 @@ function handleAudioFrame(
     if (!transitionState(conn, 'listening', app)) return;
   }
 
-  if (conn.turnState !== 'listening') {
+  if (conn.turnState === 'pending_send') {
+    // User resumed speaking during the auto-send countdown.
+    // Save current transcript and transition back to listening.
+    app.log.info({ connId: conn.id }, 'Audio during pending_send, resuming listening');
+    transitionState(conn, 'listening', app);
+  } else if (conn.turnState === 'transcribing') {
+    // Audio arrived while STT is running — buffer it silently.
+    // processAudioBuffer will detect the new audio and loop back to listening.
+    conn.audioBuffer.push(data);
+    conn.audioBufferBytes += data.length;
+    return;
+  } else if (conn.turnState !== 'listening') {
     app.log.warn(
       { connId: conn.id, state: conn.turnState },
       'Audio frame received in non-listening state, discarding',
@@ -360,6 +536,7 @@ function handleJsonMessage(
         silenceTimers.delete(conn.id);
       }
       conn.turnId = msg.turnId;
+      conn.pendingTranscript = '';
       cleanup(conn); // Clear audio buffer since we have the final text
       runLlmTtsPipeline(conn, msg.text, msg.turnId, app).catch((err) => {
         app.log.error({ connId: conn.id, err }, 'LLM/TTS pipeline failed');
@@ -391,6 +568,7 @@ function handleJsonMessage(
       if (conn.turnState === 'speaking' || conn.turnState === 'thinking') {
         conn.llmPipeline.cancel();
         conn.ttsPipeline.cancel();
+        conn.pendingTranscript = '';
         conn.turnId = null;
         // Force state to idle (bypass normal transition validation for barge-in)
         conn.turnState = 'idle';
@@ -419,14 +597,19 @@ function handleJsonMessage(
       break;
     }
 
-    case 'config':
+    case 'config': {
       // Merge partial config
       Object.assign(conn.config, msg.settings);
+      if (typeof conn.config.sessionKey === 'string') {
+        conn.config.sessionKey = conn.config.sessionKey.trim();
+      }
       app.log.info(
         { connId: conn.id, config: conn.config },
         'Config updated',
       );
+      void hydrateChatHistory(conn, app);
       break;
+    }
 
     default: {
       const _exhaustive: never = msg;
@@ -463,6 +646,7 @@ export function registerWebSocket(app: FastifyInstance) {
       turnId: null,
       audioBuffer: [],
       audioBufferBytes: 0,
+      pendingTranscript: '',
       connectedAt: Date.now(),
       lastPingAt: Date.now(),
       messageLimiter: new SlidingWindowRateLimiter(RATE_LIMIT_MSG_PER_SEC, 1_000),
@@ -475,9 +659,23 @@ export function registerWebSocket(app: FastifyInstance) {
         sendBinary: (data) => sendBinary(conn, data),
       }),
       gatewayClient,
+      lastHydratedSessionKey: null,
     };
 
     app.log.info({ connId: conn.id }, 'WebSocket connected');
+
+    // Prevent unhandled 'error' events on TtsPipeline from crashing the process.
+    // Individual chunk failures are expected when Kokoro is flaky — the TtsRouter
+    // handles fallback after repeated failures.
+    conn.ttsPipeline.on('error', (err) => {
+      app.log.error({ connId: conn.id, err }, 'TTS pipeline error');
+      sendMessage(conn, {
+        type: 'error',
+        code: 'tts_error',
+        message: err instanceof Error ? err.message : 'TTS synthesis failed',
+        recoverable: true,
+      });
+    });
 
     socket.on('message', (data: RawData, isBinary: boolean) => {
       if (!conn.messageLimiter.check()) {

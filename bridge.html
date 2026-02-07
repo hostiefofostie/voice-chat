@@ -40,6 +40,7 @@
       <button id="muteBtn" class="secondary">Mute Mic</button>
       <button id="unlockBtn" class="secondary" style="display:none">Unlock Audio</button>
       <button id="speechToggle" class="secondary">Speech: On</button>
+      <button id="autoSendToggle" class="secondary">Auto-Send: On</button>
       <button id="configBtn" class="secondary">Config</button>
     </div>
     <audio id="replyAudio" controls style="display:none;width:100%;margin:6px 0 0"></audio>
@@ -87,7 +88,7 @@
 
       const DEFAULT_TTS_INSTRUCTIONS = "Voice Affect: Calm, composed, and reassuring; project quiet authority and confidence.\n\nTone: Sincere, empathetic, and gently authoritative—express genuine apology while conveying competence.\n\nPacing: Steady and moderate; unhurried enough to communicate care, yet efficient enough to demonstrate professionalism.\n\nEmotion: Genuine empathy and understanding; speak with warmth, especially during apologies (\"I'm very sorry for any disruption...\").\n\nPronunciation: Clear and precise, emphasizing key reassurances (\"smoothly,\" \"quickly,\" \"promptly\") to reinforce confidence.\n\nPauses: Brief pauses after offering assistance or requesting details, highlighting willingness to listen and support.";
       const config = { sessionKey:'main', voice:'cedar', instructions: DEFAULT_TTS_INSTRUCTIONS };
-      let status='stopped', running=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, speechEnabled=true, isRecording=false, isMuted=false;
+      let status='stopped', running=false, busy=false, vadInstance=null, currentAssistantEl=null, currentAudio=null, lastReplyText='', audioCtx=null, audioUnlocked=false, currentSource=null, isSpeaking=false, speechEnabled=true, isRecording=false, isMuted=false, vadDebounceTimer=null, autoSendEnabled=true;
       const audioQueue = [];
       let pendingReplyText = '';
       let skippedReplyCount = 0;
@@ -362,8 +363,14 @@
         if (busy || audioQueue.length === 0) return;
         busy = true;
         setStatus('processing');
-        const next = audioQueue.shift();
-        await processAudio(next);
+        // Drain & concatenate all queued segments into one
+        let totalLen = 0;
+        for (const seg of audioQueue) totalLen += seg.length;
+        const merged = new Float32Array(totalLen);
+        let offset = 0;
+        for (const seg of audioQueue) { merged.set(seg, offset); offset += seg.length; }
+        audioQueue.length = 0;
+        await processAudio(merged);
         busy = false;
         if (running && status === 'processing') setStatus('listening');
         if (audioQueue.length > 0) processNextAudio();
@@ -385,7 +392,11 @@
             if (!running) return;
             isRecording = false;
             audioQueue.push(audio);
-            processNextAudio();
+            // Debounce: wait for more segments before processing
+            clearTimeout(vadDebounceTimer);
+            if (autoSendEnabled) {
+              vadDebounceTimer = setTimeout(() => processNextAudio(), 2500);
+            }
           },
           onnxWASMBasePath:'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
           baseAssetPath:'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/'
@@ -424,7 +435,12 @@
       if (sendBtn && textInput) {
         sendBtn.addEventListener('click', async () => {
           try { await ensureAudioContext(); audioUnlocked = true; } catch {}
-          await sendText(textInput.value);
+          if (textInput.value.trim()) {
+            await sendText(textInput.value);
+          } else if (audioQueue.length > 0 && !busy) {
+            clearTimeout(vadDebounceTimer);
+            processNextAudio();
+          }
         });
         textInput.addEventListener('keydown', async (e) => {
           if (e.key === 'Enter') {
@@ -475,6 +491,14 @@
             try { await ensureAudioContext(); audioUnlocked = true; } catch {}
             await tryPlayTts();
           }
+        });
+      }
+      const autoSendToggle = $('autoSendToggle');
+      if (autoSendToggle) {
+        autoSendToggle.addEventListener('click', () => {
+          autoSendEnabled = !autoSendEnabled;
+          autoSendToggle.textContent = autoSendEnabled ? 'Auto-Send: On' : 'Auto-Send: Off';
+          if (autoSendEnabled && audioQueue.length > 0 && !busy) processNextAudio();
         });
       }
       configBtn.addEventListener('click', () => { loadConfig(); fillConfigForm(); configDialog.showModal(); });

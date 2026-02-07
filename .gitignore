@@ -20,6 +20,7 @@ web-build/
 .ntm/
 .voicechat-device.json
 *.pem
+certs/
 
 # bv (beads viewer) local config and caches
 .bv/

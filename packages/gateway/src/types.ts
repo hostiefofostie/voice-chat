@@ -22,8 +22,8 @@ export type TurnState =
 export const VALID_TRANSITIONS: Record<TurnState, TurnState[]> = {
   idle: ['listening'],
   listening: ['transcribing', 'idle'],    // idle via barge-in cancel
-  transcribing: ['pending_send', 'idle'], // idle on empty transcript or STT error
-  pending_send: ['thinking', 'idle'],     // idle via cancel
+  transcribing: ['pending_send', 'listening', 'idle'], // listening if new audio arrives mid-STT; idle on empty/error
+  pending_send: ['thinking', 'listening', 'idle'],     // listening if user resumes speaking; idle via cancel
   thinking: ['speaking', 'idle'],         // idle via cancel
   speaking: ['idle', 'listening'],        // listening via barge-in
 };
@@ -52,6 +52,13 @@ export interface SessionConfig {
   sessionKey: string;
 }
 
+/** Hydrated chat message shape sent from server to client. */
+export interface ChatHistoryMessage {
+  role: 'user' | 'assistant';
+  text: string;
+  timestamp?: number;
+}
+
 /** Sensible defaults for a new session. */
 export const DEFAULT_CONFIG: SessionConfig = {
   autoSendDelayMs: 1500,
@@ -61,7 +68,7 @@ export const DEFAULT_CONFIG: SessionConfig = {
   vadSensitivity: 0.5,
   llmModel: 'sonnet',
   agentId: 'default',
-  sessionKey: '',
+  sessionKey: 'main',
 };
 
 // ---------------------------------------------------------------------------
@@ -144,6 +151,14 @@ export type ServerMessage =
       type: 'llm_done';
       /** The complete LLM response. */
       fullText: string;
+    }
+  | {
+      /** Hydrated chat history from OpenClaw for the active session. */
+      type: 'chat_history';
+      /** Session key used for history fetch. */
+      sessionKey: string;
+      /** Chronological user/assistant messages for UI hydration. */
+      messages: ChatHistoryMessage[];
     }
   | {
       /** Metadata for an upcoming TTS audio chunk (sent before the binary frame). */

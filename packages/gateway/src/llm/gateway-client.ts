@@ -13,7 +13,13 @@ import naclUtil from 'tweetnacl-util';
 // Logger
 // ---------------------------------------------------------------------------
 
-const log = pino({ name: 'gateway-client' });
+const log = pino({
+  name: 'gateway-client',
+  level: process.env.LOG_LEVEL || 'info',
+  ...(process.env.NODE_ENV === 'development'
+    ? { transport: { target: 'pino-pretty' } }
+    : {}),
+});
 
 // ---------------------------------------------------------------------------
 // Gateway Frame Protocol Types
@@ -158,6 +164,12 @@ interface SavedDeviceLegacyDer {
 // ---------------------------------------------------------------------------
 
 const GATEWAY_URL = process.env.VOICECHAT_GATEWAY_URL || 'ws://127.0.0.1:18789/gateway';
+const GATEWAY_ORIGIN = process.env.VOICECHAT_GATEWAY_ORIGIN || (() => {
+  try {
+    const u = new URL(GATEWAY_URL);
+    return `${u.protocol === 'wss:' ? 'https' : 'http'}://${u.host}`;
+  } catch { return ''; }
+})();
 const GATEWAY_TOKEN = process.env.VOICECHAT_GATEWAY_TOKEN || process.env.OPENCLAW_GATEWAY_TOKEN || '';
 const GATEWAY_PASSWORD = process.env.VOICECHAT_GATEWAY_PASSWORD || process.env.OPENCLAW_GATEWAY_PASSWORD || '';
 const GATEWAY_PROTOCOL = Number(process.env.VOICECHAT_GATEWAY_PROTOCOL || 3);
@@ -568,7 +580,9 @@ export class GatewayClient {
       let settled = false;
 
       this.emitState('connecting');
-      const ws = new WebSocket(GATEWAY_URL);
+      const wsOpts: Record<string, unknown> = {};
+      if (GATEWAY_ORIGIN) wsOpts.origin = GATEWAY_ORIGIN;
+      const ws = new WebSocket(GATEWAY_URL, wsOpts);
       this.ws = ws;
 
       const finish = (err?: Error): void => {

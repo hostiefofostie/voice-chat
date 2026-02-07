@@ -1,10 +1,22 @@
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 import { registerWebSocket } from './ws/handler.js';
 
+// Load TLS certs if available (enables HTTPS/WSS)
+const certPath = process.env.TLS_CERT || path.resolve(process.cwd(), '..', '..', 'certs', 'tailscale.crt');
+const keyPath = process.env.TLS_KEY || path.resolve(process.cwd(), '..', '..', 'certs', 'tailscale.key');
+const httpsOpts = fs.existsSync(certPath) && fs.existsSync(keyPath)
+  ? { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) }
+  : undefined;
+
+if (httpsOpts) console.log('TLS certs loaded — starting with HTTPS/WSS');
+
 const app = Fastify({
+  ...(httpsOpts ? { https: httpsOpts } : {}),
   logger: {
     level: process.env.LOG_LEVEL || 'info',
     transport: process.env.NODE_ENV === 'development'

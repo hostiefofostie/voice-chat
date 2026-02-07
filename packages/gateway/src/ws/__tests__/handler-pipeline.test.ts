@@ -16,6 +16,7 @@ import WebSocket from 'ws';
 const mockTranscribe = vi.fn();
 const mockSttHealthCheck = vi.fn().mockResolvedValue(true);
 const mockSendChat = vi.fn();
+const mockSendRequest = vi.fn();
 const mockGatewayClose = vi.fn();
 const mockEnsureConnected = vi.fn().mockResolvedValue(undefined);
 const mockKokoroSynthesize = vi.fn();
@@ -32,10 +33,18 @@ vi.mock('../../stt/parakeet-client.js', () => ({
 vi.mock('../../llm/gateway-client.js', () => ({
   GatewayClient: vi.fn().mockImplementation(function (this: any) {
     this.sendChat = mockSendChat;
+    this.sendRequest = mockSendRequest;
     this.ensureConnected = mockEnsureConnected;
     this.close = mockGatewayClose;
     this.onConnectionState = vi.fn().mockReturnValue(() => {});
   }),
+  extractText: (value: unknown) => {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map((v) => (typeof v === 'object' && v && (v as any).text ? (v as any).text : '')).join('');
+    if (typeof value === 'object' && value !== null && typeof (value as any).text === 'string') return (value as any).text;
+    return '';
+  },
 }));
 
 vi.mock('../../tts/kokoro-client.js', () => ({
@@ -211,6 +220,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Default mock implementations
   mockKokoroSynthesize.mockResolvedValue(makeWav());
+  mockSendRequest.mockResolvedValue({ sessionKey: 'main', messages: [] });
 });
 
 function connectWs(): Promise<WebSocket> {
@@ -361,6 +371,88 @@ describe('Handler pipeline — text-input flow', () => {
       expect(stateMsg.state).toBe('idle');
 
       (chatResolver as (() => void) | null)?.();
+    } finally {
+      await closeWs(ws);
+    }
+  });
+});
+
+describe('Handler pipeline — session routing + history hydration', () => {
+  it('uses config.sessionKey for chat.send (trimmed) and defaults to main', async () => {
+    mockSendChat.mockImplementation(async (_s: string, _m: string, callbacks: Record<string, unknown>) => {
+      const onFinal = callbacks.onFinal as (text: string, payload: Record<string, unknown>) => void;
+      onFinal?.('ok', {});
+      return 'ok';
+    });
+
+    const ws = await connectWs();
+    try {
+      // No config sent yet -> should use default main
+      sendJson(ws, {
+        type: 'transcript_send',
+        text: 'first',
+        turnId: 'turn-default-main',
+      });
+
+      await vi.waitFor(() => {
+        expect(mockSendChat).toHaveBeenCalled();
+      });
+      expect(mockSendChat.mock.calls[0][0]).toBe('main');
+
+      // Update config with padded session key; handler should trim
+      sendJson(ws, {
+        type: 'config',
+        settings: { sessionKey: '  custom-session  ' },
+      });
+
+      sendJson(ws, {
+        type: 'transcript_send',
+        text: 'second',
+        turnId: 'turn-custom',
+      });
+
+      await vi.waitFor(() => {
+        expect(mockSendChat).toHaveBeenCalledTimes(2);
+      });
+      expect(mockSendChat.mock.calls[1][0]).toBe('custom-session');
+    } finally {
+      await closeWs(ws);
+    }
+  });
+
+  it('hydrates chat history on config update via chat.history', async () => {
+    mockSendRequest.mockResolvedValue({
+      sessionKey: 'main',
+      messages: [
+        { role: 'assistant', content: [{ type: 'text', text: 'Latest reply' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Earlier question' }] },
+      ],
+    });
+
+    const ws = await connectWs();
+    try {
+      const historyPromise = waitForMessage(ws, 'chat_history', 3000);
+
+      sendJson(ws, {
+        type: 'config',
+        settings: { sessionKey: 'main' },
+      });
+
+      const historyMsg = await historyPromise;
+
+      expect(mockSendRequest).toHaveBeenCalledWith('chat.history', {
+        sessionKey: 'main',
+        limit: 120,
+      });
+      expect(historyMsg.type).toBe('chat_history');
+      expect(historyMsg.sessionKey).toBe('main');
+
+      const messages = historyMsg.messages as Array<{ role: string; text: string }>;
+      // Should be chronological after hydration (oldest first)
+      expect(messages[0]?.role).toBe('user');
+      expect(messages[0]?.text).toBe('Earlier question');
+      expect(messages[1]?.role).toBe('assistant');
+      expect(messages[1]?.text).toBe('Latest reply');
     } finally {
       await closeWs(ws);
     }
