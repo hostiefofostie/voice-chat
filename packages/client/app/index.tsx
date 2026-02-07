@@ -53,6 +53,7 @@ export default function Index() {
   const appendLlmToken = useTurnStore((s) => s.appendLlmToken);
   const resetTurn = useTurnStore((s) => s.reset);
   const addMessage = useChatStore((s) => s.addMessage);
+  const setMessages = useChatStore((s) => s.setMessages);
 
   // ---- Error recovery ----
   const errors = useErrorRecovery();
@@ -119,6 +120,10 @@ export default function Index() {
             useErrorStore.getState().reportLlmDone();
             break;
 
+          case 'chat_history':
+            setMessages(msg.messages);
+            break;
+
           case 'tts_meta':
             pendingTtsMetaRef.current = {
               format: msg.format,
@@ -170,6 +175,7 @@ export default function Index() {
         reconcile,
         appendLlmToken,
         addMessage,
+        setMessages,
         resetTurn,
       ],
     ),
@@ -518,9 +524,6 @@ const styles = StyleSheet.create({
   root: {
     flex: 1,
     backgroundColor: '#0f1115',
-    maxWidth: 720,
-    width: '100%',
-    alignSelf: 'center',
   },
   header: {
     flexDirection: 'row',

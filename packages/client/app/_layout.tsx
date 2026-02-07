@@ -1,21 +1,35 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { View, Platform, StyleSheet } from 'react-native';
 
 export default function RootLayout() {
-  return (
+  const content = (
     <>
       <Stack
         screenOptions={{
-          headerStyle: { backgroundColor: '#1a1a2e' },
-          headerTintColor: '#fff',
-          headerTitleStyle: { fontWeight: 'bold' },
-          contentStyle: { backgroundColor: '#16213e' },
+          headerShown: false,
+          contentStyle: { backgroundColor: '#0f1115' },
         }}
       >
-        <Stack.Screen name="index" options={{ title: 'Voice Chat' }} />
-        <Stack.Screen name="settings" options={{ title: 'Settings' }} />
+        <Stack.Screen name="index" />
+        <Stack.Screen name="settings" />
       </Stack>
       <StatusBar style="light" />
     </>
   );
+
+  if (Platform.OS === 'web') {
+    return <View style={styles.webWrapper}>{content}</View>;
+  }
+  return content;
 }
+
+const styles = StyleSheet.create({
+  webWrapper: {
+    flex: 1,
+    maxWidth: 720,
+    width: '100%',
+    alignSelf: 'center',
+    backgroundColor: '#0f1115',
+  },
+});
