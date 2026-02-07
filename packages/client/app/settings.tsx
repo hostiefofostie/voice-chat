@@ -96,6 +96,37 @@ function Picker<T extends string>({
 // Settings Screen
 // ---------------------------------------------------------------------------
 
+const KOKORO_VOICES = [
+  { label: 'Heart (F)', value: 'af_heart' },
+  { label: 'Alloy (F)', value: 'af_alloy' },
+  { label: 'Aoede (F)', value: 'af_aoede' },
+  { label: 'Bella (F)', value: 'af_bella' },
+  { label: 'Jessica (F)', value: 'af_jessica' },
+  { label: 'Kore (F)', value: 'af_kore' },
+  { label: 'Nicole (F)', value: 'af_nicole' },
+  { label: 'Nova (F)', value: 'af_nova' },
+  { label: 'River (F)', value: 'af_river' },
+  { label: 'Sarah (F)', value: 'af_sarah' },
+  { label: 'Sky (F)', value: 'af_sky' },
+  { label: 'Adam (M)', value: 'am_adam' },
+  { label: 'Echo (M)', value: 'am_echo' },
+  { label: 'Eric (M)', value: 'am_eric' },
+  { label: 'Fenrir (M)', value: 'am_fenrir' },
+  { label: 'Liam (M)', value: 'am_liam' },
+  { label: 'Michael (M)', value: 'am_michael' },
+  { label: 'Onyx (M)', value: 'am_onyx' },
+  { label: 'Puck (M)', value: 'am_puck' },
+  { label: 'Santa (M)', value: 'am_santa' },
+  { label: 'Alice (F, British)', value: 'bf_alice' },
+  { label: 'Emma (F, British)', value: 'bf_emma' },
+  { label: 'Isabella (F, British)', value: 'bf_isabella' },
+  { label: 'Lily (F, British)', value: 'bf_lily' },
+  { label: 'Daniel (M, British)', value: 'bm_daniel' },
+  { label: 'Fable (M, British)', value: 'bm_fable' },
+  { label: 'George (M, British)', value: 'bm_george' },
+  { label: 'Lewis (M, British)', value: 'bm_lewis' },
+];
+
 export default function Settings() {
   const router = useRouter();
   const config = useConfigStore((s) => s.config);
@@ -141,13 +172,21 @@ export default function Settings() {
           </SettingRow>
           <View style={styles.divider} />
           <SettingRow label="Voice">
-            <TextInput
-              style={styles.input}
-              value={config.ttsVoice}
-              onChangeText={(v) => update({ ttsVoice: v })}
-              placeholder="e.g. af_heart"
-              placeholderTextColor="#6b7280"
-            />
+            {config.ttsProvider === 'kokoro' ? (
+              <Picker
+                value={config.ttsVoice}
+                options={KOKORO_VOICES}
+                onValueChange={(v) => update({ ttsVoice: v })}
+              />
+            ) : (
+              <TextInput
+                style={styles.input}
+                value={config.ttsVoice}
+                onChangeText={(v) => update({ ttsVoice: v })}
+                placeholder="e.g. cedar"
+                placeholderTextColor="#6b7280"
+              />
+            )}
           </SettingRow>
         </View>
 
