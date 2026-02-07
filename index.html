@@ -12,12 +12,12 @@
     #status{display:flex;align-items:center;gap:8px;margin-bottom:12px;font-weight:600}
     #indicator{font-size:18px}
     #chat{height:300px;overflow:auto;background:#0b0e14;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:10px}
-    .msg{padding:8px 10px;border-radius:10px;line-height:1.35;white-space:pre-wrap}
+    .msg{padding:8px 10px;border-radius:10px;line-height:1.35;white-space:pre-wrap;max-width:85%;word-wrap:break-word;overflow-wrap:break-word}
     .msg.user{background:#1f2937;align-self:flex-end}
     .msg.assistant{background:#0f172a;align-self:flex-start}
     #controls{display:flex;gap:8px;margin:12px 0 6px;flex-wrap:wrap}
     #textRow{display:flex;gap:8px;margin:10px 0 0}
-    #textInput{flex:1;padding:10px 12px;border-radius:10px;border:1px solid #334155;background:#0b0e14;color:#e5e7eb}
+    #textInput{flex:1;padding:10px 12px;border-radius:10px;border:1px solid #334155;background:#0b0e14;color:#e5e7eb;resize:none;overflow-y:auto;max-height:120px;line-height:1.4;font-family:inherit;font-size:inherit}
     #ttsInstructions{width:100%;min-height:70px;padding:8px 10px;border-radius:8px;border:1px solid #334155;background:#0b0e14;color:#e5e7eb;resize:vertical}
     button{padding:10px 14px;border-radius:10px;border:0;background:#2563eb;color:white;font-weight:600;cursor:pointer}
     button.secondary{background:#334155}
@@ -31,7 +31,7 @@
     <div id="status"><span id="indicator">⚪</span><span id="status-text">Idle</span></div>
     <div id="chat"></div>
     <div id="textRow">
-      <input id="textInput" type="text" placeholder="Type a message…">
+      <textarea id="textInput" rows="1" placeholder="Type a message…"></textarea>
       <button id="sendBtn" class="secondary">Send</button>
     </div>
     <div id="controls">
@@ -1159,11 +1159,16 @@
           try { await unlockAudio(); } catch {}
           await sendText(textInput.value);
         });
+        textInput.addEventListener('input', () => {
+          textInput.style.height = 'auto';
+          textInput.style.height = Math.min(textInput.scrollHeight, 120) + 'px';
+        });
         textInput.addEventListener('keydown', async (e) => {
-          if (e.key === 'Enter') {
+          if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             try { await unlockAudio(); } catch {}
             await sendText(textInput.value);
+            textInput.style.height = 'auto';
           }
         });
       }
