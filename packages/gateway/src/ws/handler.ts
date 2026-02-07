@@ -18,6 +18,7 @@ import { OpenAiTtsClient } from '../tts/openai-client.js';
 import { TtsRouter } from '../tts/router.js';
 import { TtsPipeline } from '../tts/pipeline.js';
 import { Turn } from './turn.js';
+import { MetricsRegistry, NOOP_METRICS } from '../metrics/registry.js';
 
 // ---------------------------------------------------------------------------
 // Connection State
@@ -37,6 +38,7 @@ interface ConnectionState {
   ttsPipeline: TtsPipeline;
   gatewayClient: GatewayClient;
   lastHydratedSessionKey: string | null;
+  metrics: MetricsRegistry;
 }
 
 const MAX_AUDIO_BUFFER_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -65,11 +67,14 @@ function getGatewayClient(): GatewayClient {
 function sendMessage(conn: ConnectionState, msg: ServerMessage) {
   if (conn.ws.readyState !== WebSocket.OPEN) return;
   conn.ws.send(JSON.stringify(msg));
+  conn.metrics.increment('ws_messages_total', { direction: 'out', type: msg.type });
 }
 
 function sendBinary(conn: ConnectionState, data: Buffer) {
   if (conn.ws.readyState !== WebSocket.OPEN) return;
   conn.ws.send(data, { binary: true });
+  conn.metrics.increment('ws_messages_total', { direction: 'out', type: 'audio' });
+  conn.metrics.increment('ws_audio_bytes_total', { direction: 'out' }, data.length);
 }
 
 function normalizeSessionKey(raw: unknown): string {
@@ -333,16 +338,20 @@ function handleJsonMessage(
 // WebSocket Route Registration
 // ---------------------------------------------------------------------------
 
-export function registerWebSocket(app: FastifyInstance) {
+let _activeConnections = 0;
+
+export function registerWebSocket(app: FastifyInstance, metrics?: MetricsRegistry) {
+  const m = metrics ?? NOOP_METRICS;
+
   app.get('/ws', { websocket: true }, (socket, req) => {
     // Create per-connection pipeline instances
     const gatewayClient = getGatewayClient();
     const parakeetClient = new ParakeetClient();
-    const sttRouter = new SttRouter(parakeetClient);
-    const llmPipeline = new LlmPipeline(gatewayClient);
+    const sttRouter = new SttRouter(parakeetClient, { metrics: m });
+    const llmPipeline = new LlmPipeline(gatewayClient, { metrics: m });
     const kokoroClient = new KokoroClient();
     const openaiTtsClient = new OpenAiTtsClient();
-    const ttsRouter = new TtsRouter(kokoroClient, openaiTtsClient);
+    const ttsRouter = new TtsRouter(kokoroClient, openaiTtsClient, 'kokoro', { metrics: m });
 
     const conn: ConnectionState = {
       id: crypto.randomUUID(),
@@ -359,11 +368,16 @@ export function registerWebSocket(app: FastifyInstance) {
         ttsRouter,
         sendJson: (msg) => sendMessage(conn, msg),
         sendBinary: (data) => sendBinary(conn, data),
+        metrics: m,
       }),
       gatewayClient,
       lastHydratedSessionKey: null,
+      metrics: m,
     };
 
+    _activeConnections++;
+    m.increment('ws_connections_total');
+    m.gauge('ws_connections_active', _activeConnections);
     app.log.info({ connId: conn.id }, 'WebSocket connected');
 
     // Prevent unhandled 'error' events on TtsPipeline from crashing the process.
@@ -398,10 +412,13 @@ export function registerWebSocket(app: FastifyInstance) {
       }
 
       if (isBinary) {
+        m.increment('ws_messages_total', { direction: 'in', type: 'audio' });
+        m.increment('ws_audio_bytes_total', { direction: 'in' }, (data as Buffer).length);
         handleAudioFrame(conn, data as Buffer, app);
       } else {
         try {
           const msg: ClientMessage = JSON.parse(data.toString());
+          m.increment('ws_messages_total', { direction: 'in', type: msg.type });
           handleJsonMessage(conn, msg, app);
         } catch {
           sendMessage(conn, {
@@ -415,6 +432,8 @@ export function registerWebSocket(app: FastifyInstance) {
     });
 
     socket.on('close', () => {
+      _activeConnections--;
+      m.gauge('ws_connections_active', _activeConnections);
       app.log.info({ connId: conn.id }, 'WebSocket disconnected');
       cancelActiveTurn(conn);
       conn.messageLimiter.reset();

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { GatewayClient } from './gateway-client.js';
 import { PhraseChunker } from '../tts/phrase-chunker.js';
+import { MetricsRegistry, NOOP_METRICS } from '../metrics/registry.js';
 
 /**
  * LLM pipeline: forwards transcripts to OpenClaw Gateway and streams tokens back.
@@ -19,11 +20,13 @@ export class LlmPipeline extends EventEmitter {
   private abortController: AbortController | null = null;
   private cancelled: boolean = false;
   private activeTurnId: string | null = null;
+  private metrics: MetricsRegistry;
 
-  constructor(gateway: GatewayClient) {
+  constructor(gateway: GatewayClient, options?: { metrics?: MetricsRegistry }) {
     super();
     this.gateway = gateway;
     this.phraseChunker = new PhraseChunker();
+    this.metrics = options?.metrics ?? NOOP_METRICS;
   }
 
   async sendTranscript(text: string, sessionKey: string, turnId: string): Promise<void> {
@@ -35,6 +38,8 @@ export class LlmPipeline extends EventEmitter {
     this.abortController = new AbortController();
 
     const message = `[[voice]] Be brief.\n${text}`;
+    const llmStart = performance.now();
+    let firstTokenRecorded = false;
 
     try {
       await this.gateway.sendChat(sessionKey, message, {
@@ -49,6 +54,11 @@ export class LlmPipeline extends EventEmitter {
           this.accumulatedText = fullBuffer;
 
           if (token) {
+            if (!firstTokenRecorded) {
+              firstTokenRecorded = true;
+              this.metrics.observe('turn_llm_ttft_ms', performance.now() - llmStart);
+            }
+
             this.emit('llm_token', { token, fullText: this.accumulatedText });
 
             // Feed to phrase chunker for TTS pipelining
@@ -60,6 +70,8 @@ export class LlmPipeline extends EventEmitter {
         },
         onFinal: (finalText: string, _payload: Record<string, unknown>) => {
           if (this.cancelled) return; // cancel() already emitted llm_done
+
+          this.metrics.observe('turn_llm_total_ms', performance.now() - llmStart);
 
           // Flush remaining text from chunker
           const remaining = this.phraseChunker.feed('', true);

@@ -1,12 +1,14 @@
 import { EventEmitter } from 'events';
 import { TtsRouter } from './router.js';
 import { ServerMessage } from '../types.js';
+import { MetricsRegistry, NOOP_METRICS } from '../metrics/registry.js';
 
 interface TtsPipelineOptions {
   ttsRouter: TtsRouter;
   sendJson: (msg: ServerMessage) => void;
   sendBinary: (data: Buffer) => void;
   maxParallel?: number;
+  metrics?: MetricsRegistry;
 }
 
 export class TtsPipeline extends EventEmitter {
@@ -31,16 +33,26 @@ export class TtsPipeline extends EventEmitter {
   private drainResolve: (() => void) | null = null;
   private drainTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  // Timing for TTS latency metrics
+  private metrics: MetricsRegistry;
+  private ttsStartAt: number = 0;
+  private firstChunkSent: boolean = false;
+
   constructor(options: TtsPipelineOptions) {
     super();
     this.ttsRouter = options.ttsRouter;
     this.sendJson = options.sendJson;
     this.sendBinary = options.sendBinary;
     this.maxParallel = options.maxParallel || 2;
+    this.metrics = options.metrics ?? NOOP_METRICS;
   }
 
   async processChunk(text: string, index: number, turnId: string) {
     if (this.cancelled) return;
+    if (this.totalChunks === 0) {
+      this.ttsStartAt = performance.now();
+      this.firstChunkSent = false;
+    }
     this.totalChunks = Math.max(this.totalChunks, index + 1);
     this.pendingChunks.set(index, { text, turnId });
     await this.dispatch();
@@ -49,8 +61,11 @@ export class TtsPipeline extends EventEmitter {
   async finish() {
     await this.drainAll();
     if (!this.cancelled) {
-      if (this.totalChunks > 0 && this.failedTotal === this.totalChunks) {
-        this.emit('all_failed');
+      if (this.totalChunks > 0) {
+        this.metrics.observe('turn_tts_total_ms', performance.now() - this.ttsStartAt);
+        if (this.failedTotal === this.totalChunks) {
+          this.emit('all_failed');
+        }
       }
       this.sendJson({ type: 'tts_done' });
       this.emit('done');
@@ -76,6 +91,8 @@ export class TtsPipeline extends EventEmitter {
     this.inFlight = 0;
     this.cancelled = false;
     this.generation++;
+    this.ttsStartAt = 0;
+    this.firstChunkSent = false;
     this.resolveDrain();
   }
 
@@ -140,6 +157,11 @@ export class TtsPipeline extends EventEmitter {
           durationMs = rawSampleRate > 0
             ? Math.round(dataSize / (rawSampleRate * bytesPerSample) * 1000)
             : 0;
+        }
+
+        if (!this.firstChunkSent) {
+          this.firstChunkSent = true;
+          this.metrics.observe('turn_tts_first_chunk_ms', performance.now() - this.ttsStartAt);
         }
 
         this.sendJson({

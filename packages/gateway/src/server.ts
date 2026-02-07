@@ -5,6 +5,7 @@ import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
 import cors from '@fastify/cors';
 import { registerWebSocket } from './ws/handler.js';
+import { MetricsRegistry } from './metrics/registry.js';
 
 // Load TLS certs if available (enables HTTPS/WSS)
 const certPath = process.env.TLS_CERT || path.resolve(process.cwd(), '..', '..', 'certs', 'tailscale.crt');
@@ -33,8 +34,11 @@ await app.register(websocket, {
   }
 });
 
+// Metrics
+const metrics = new MetricsRegistry();
+
 // WebSocket handler
-registerWebSocket(app);
+registerWebSocket(app, metrics);
 
 // Health endpoint
 app.get('/health', async () => ({
@@ -42,6 +46,9 @@ app.get('/health', async () => ({
   uptime: process.uptime(),
   timestamp: new Date().toISOString()
 }));
+
+// Metrics endpoint
+app.get('/metrics', async () => metrics.snapshot());
 
 // Graceful shutdown
 const shutdown = async (signal: string) => {
