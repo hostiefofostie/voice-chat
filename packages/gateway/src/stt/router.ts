@@ -1,42 +1,64 @@
 import { EventEmitter } from 'events';
 import { ParakeetClient } from './parakeet-client.js';
 import { TranscribeResult } from '../types.js';
+import {
+  CircuitBreaker,
+  CircuitBreakerConfig,
+  CircuitState,
+  DEFAULT_CIRCUIT_CONFIG,
+} from '../common/circuit-breaker.js';
 
 export class SttRouter extends EventEmitter {
   private primary: ParakeetClient;
-  private usingFallback: boolean = false;
-  private healthCheckInterval: NodeJS.Timeout | null = null;
-  private consecutiveFailures: number = 0;
-  private readonly failureThreshold = 3;
+  private breaker: CircuitBreaker;
 
-  constructor(primary: ParakeetClient) {
+  constructor(primary: ParakeetClient, config?: Partial<CircuitBreakerConfig>) {
     super();
     this.primary = primary;
+    this.breaker = new CircuitBreaker({
+      ...DEFAULT_CIRCUIT_CONFIG,
+      name: 'stt:parakeet',
+      failureThreshold: 3,
+      cooldownMs: 10_000,
+      ...config,
+    });
+    this.breaker.onStateChange((from, to) => {
+      this.emit('circuit_state', { provider: 'parakeet', from, to });
+      // Backward-compatible events
+      if (to === 'open') {
+        this.emit('provider_switched', { from: 'parakeet', to: 'cloud_stub' });
+      }
+      if (from !== 'closed' && to === 'closed') {
+        this.emit('provider_recovered', { provider: 'parakeet' });
+      }
+    });
   }
 
   get activeProvider(): string {
-    return this.usingFallback ? 'cloud_stub' : 'parakeet';
+    return this.breaker.state === 'closed' ? 'parakeet' : 'cloud_stub';
+  }
+
+  get circuitState(): CircuitState {
+    return this.breaker.state;
   }
 
   async transcribe(audio: Buffer): Promise<TranscribeResult> {
-    if (!this.usingFallback) {
-      try {
-        const result = await this.primary.transcribe(audio);
-        this.consecutiveFailures = 0;
-        return result;
-      } catch (err) {
-        this.consecutiveFailures++;
-        if (this.consecutiveFailures >= this.failureThreshold) {
-          this.switchToFallback();
-          // After switching to fallback, use it immediately
-          return this.cloudFallback(audio);
-        }
-        // Below threshold: re-throw so callers can show an error rather
-        // than sending a placeholder transcript to the LLM.
-        throw err;
-      }
+    if (!this.breaker.canRequest()) {
+      return this.cloudFallback(audio);
     }
-    return this.cloudFallback(audio);
+
+    try {
+      const result = await this.primary.transcribe(audio);
+      this.breaker.recordSuccess();
+      return result;
+    } catch (err) {
+      this.breaker.recordFailure();
+      // If breaker just tripped open, use fallback for this request
+      if (!this.breaker.canRequest()) {
+        return this.cloudFallback(audio);
+      }
+      throw err;
+    }
   }
 
   private cloudFallback(_audio: Buffer): TranscribeResult {
@@ -48,34 +70,7 @@ export class SttRouter extends EventEmitter {
     };
   }
 
-  private switchToFallback() {
-    this.usingFallback = true;
-    this.emit('provider_switched', { from: 'parakeet', to: 'cloud_stub' });
-
-    // Clear any existing health check before starting a new one
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-      this.healthCheckInterval = null;
-    }
-
-    // Start health checks to auto-recover
-    this.healthCheckInterval = setInterval(async () => {
-      if (await this.primary.healthCheck()) {
-        this.usingFallback = false;
-        this.consecutiveFailures = 0;
-        if (this.healthCheckInterval) {
-          clearInterval(this.healthCheckInterval);
-          this.healthCheckInterval = null;
-        }
-        this.emit('provider_recovered', { provider: 'parakeet' });
-      }
-    }, 15000);
-  }
-
   destroy() {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-      this.healthCheckInterval = null;
-    }
+    this.breaker.destroy();
   }
 }

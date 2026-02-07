@@ -190,4 +190,131 @@ describe('TtsPipeline', () => {
     expect(meta.sampleRate).toBe(16000);
     expect(meta.durationMs).toBeGreaterThan(0);
   });
+
+  it('event-driven drain resolves without polling delay', async () => {
+    const start = Date.now();
+    await pipeline.processChunk('Fast chunk', 0, 'turn-1');
+    await pipeline.finish();
+    const elapsed = Date.now() - start;
+
+    // With event-driven drain, finish() should resolve almost instantly
+    // after synthesis completes (no 50ms polling delay)
+    expect(elapsed).toBeLessThan(500);
+    expect(sentBinary.length).toBe(1);
+  });
+
+  it('failed chunk is tracked and skipped in sendInOrder', async () => {
+    let callCount = 0;
+    const partialFailRouter = {
+      synthesize: vi.fn(async (text: string) => {
+        callCount++;
+        if (callCount === 2) {
+          // Fail the second chunk (index 1)
+          throw new Error('TTS failed for chunk 1');
+        }
+        const pcm = Buffer.alloc(3200);
+        const header = Buffer.alloc(44);
+        header.write('RIFF', 0);
+        header.writeUInt32LE(36 + pcm.length, 4);
+        header.write('WAVE', 8);
+        header.write('fmt ', 12);
+        header.writeUInt32LE(16, 16);
+        header.writeUInt16LE(1, 20);
+        header.writeUInt16LE(1, 22);
+        header.writeUInt32LE(16000, 24);
+        header.writeUInt32LE(32000, 28);
+        header.writeUInt16LE(2, 32);
+        header.writeUInt16LE(16, 34);
+        header.write('data', 36);
+        header.writeUInt32LE(pcm.length, 40);
+        return { audio: Buffer.concat([header, pcm]), provider: 'mock' };
+      }),
+    } as unknown as TtsRouter;
+
+    const json: ServerMessage[] = [];
+    const binary: Buffer[] = [];
+    const failPipeline = new TtsPipeline({
+      ttsRouter: partialFailRouter,
+      sendJson: (msg) => json.push(msg),
+      sendBinary: (data) => binary.push(data),
+      maxParallel: 2,
+    });
+    failPipeline.on('error', () => {}); // Prevent unhandled error
+
+    await failPipeline.processChunk('Chunk 0', 0, 'turn-1');
+    await failPipeline.processChunk('Chunk 1', 1, 'turn-1');
+    await failPipeline.processChunk('Chunk 2', 2, 'turn-1');
+    await failPipeline.finish();
+
+    // Chunks 0 and 2 should be sent, chunk 1 skipped
+    expect(binary.length).toBe(2);
+    const metaMsgs = json.filter((m) => m.type === 'tts_meta') as Array<{ type: 'tts_meta'; index: number }>;
+    expect(metaMsgs[0].index).toBe(0);
+    expect(metaMsgs[1].index).toBe(2);
+  });
+
+  it('emits all_failed when every chunk fails', async () => {
+    // Use a failing router with a delay to ensure synthesis is in-flight
+    // when finish() is called
+    const failingRouter = {
+      synthesize: vi.fn(async () => {
+        await new Promise((r) => setTimeout(r, 100));
+        throw new Error('All providers down');
+      }),
+    } as unknown as TtsRouter;
+
+    const json: ServerMessage[] = [];
+    const allFailedPipeline = new TtsPipeline({
+      ttsRouter: failingRouter,
+      sendJson: (msg) => json.push(msg),
+      sendBinary: () => {},
+      maxParallel: 2,
+    });
+    allFailedPipeline.on('error', () => {}); // Prevent unhandled error
+
+    const allFailedHandler = vi.fn();
+    allFailedPipeline.on('all_failed', allFailedHandler);
+
+    await allFailedPipeline.processChunk('Chunk 0', 0, 'turn-1');
+    await allFailedPipeline.processChunk('Chunk 1', 1, 'turn-1');
+
+    // Both should be in-flight now
+    expect((allFailedPipeline as any).inFlight).toBe(2);
+
+    // finish() calls drainAll which waits for inFlight to hit 0
+    await allFailedPipeline.finish();
+
+    expect((allFailedPipeline as any).failedTotal).toBe(2);
+    expect(allFailedHandler).toHaveBeenCalledTimes(1);
+    expect(json.some((m) => m.type === 'tts_done')).toBe(true);
+  });
+
+  it('reset clears drain state and failed chunks', async () => {
+    const failingRouter = {
+      synthesize: vi.fn(async () => { throw new Error('fail'); }),
+    } as unknown as TtsRouter;
+
+    const json: ServerMessage[] = [];
+    const resetPipeline = new TtsPipeline({
+      ttsRouter: failingRouter,
+      sendJson: (msg) => json.push(msg),
+      sendBinary: () => {},
+    });
+    resetPipeline.on('error', () => {});
+
+    await resetPipeline.processChunk('Fail', 0, 'turn-1');
+    await new Promise((r) => setTimeout(r, 10));
+    resetPipeline.reset();
+
+    // After reset, pipeline should work with a new router
+    const goodRouter = createMockRouter();
+    (resetPipeline as any).ttsRouter = goodRouter;
+    json.length = 0;
+
+    await resetPipeline.processChunk('Success', 0, 'turn-2');
+    await resetPipeline.finish();
+
+    expect(json.some((m) => m.type === 'tts_meta')).toBe(true);
+    expect(json.some((m) => m.type === 'tts_done')).toBe(true);
+  });
 });

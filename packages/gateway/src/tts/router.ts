@@ -1,33 +1,68 @@
 import { EventEmitter } from 'events';
 import { KokoroClient } from './kokoro-client.js';
 import { OpenAiTtsClient } from './openai-client.js';
+import {
+  CircuitBreaker,
+  CircuitBreakerConfig,
+  CircuitState,
+  DEFAULT_CIRCUIT_CONFIG,
+} from '../common/circuit-breaker.js';
 
 export class TtsRouter extends EventEmitter {
-  private activeProvider: 'kokoro' | 'openai';
   private kokoro: KokoroClient;
   private openai: OpenAiTtsClient;
-  private failures: number[] = []; // timestamps
-  private readonly failureWindow = 60_000;
-  private readonly failureThreshold = 3;
+  private preferredProvider: 'kokoro' | 'openai';
+  private kokoroBreaker: CircuitBreaker;
+  private openaiBreaker: CircuitBreaker;
 
   constructor(
     kokoro: KokoroClient,
     openai: OpenAiTtsClient,
     defaultProvider: 'kokoro' | 'openai' = 'kokoro',
+    breakerConfig?: Partial<CircuitBreakerConfig>,
   ) {
     super();
     this.kokoro = kokoro;
     this.openai = openai;
-    this.activeProvider = defaultProvider;
+    this.preferredProvider = defaultProvider;
+    this.kokoroBreaker = new CircuitBreaker({
+      ...DEFAULT_CIRCUIT_CONFIG,
+      name: 'tts:kokoro',
+      cooldownMs: 5_000,
+      ...breakerConfig,
+    });
+    this.openaiBreaker = new CircuitBreaker({
+      ...DEFAULT_CIRCUIT_CONFIG,
+      name: 'tts:openai',
+      cooldownMs: 15_000,
+      ...breakerConfig,
+    });
+    this.kokoroBreaker.onStateChange((from, to) => {
+      this.emit('circuit_state', { provider: 'kokoro', from, to });
+      if (to === 'open') {
+        this.emit('provider_switched', { from: 'kokoro', to: 'openai' });
+      }
+    });
+    this.openaiBreaker.onStateChange((from, to) => {
+      this.emit('circuit_state', { provider: 'openai', from, to });
+      if (to === 'open') {
+        this.emit('provider_switched', { from: 'openai', to: 'kokoro' });
+      }
+    });
   }
 
   get provider(): 'kokoro' | 'openai' {
-    return this.activeProvider;
+    return this.preferredProvider;
+  }
+
+  circuitStateOf(provider: 'kokoro' | 'openai'): CircuitState {
+    return provider === 'kokoro'
+      ? this.kokoroBreaker.state
+      : this.openaiBreaker.state;
   }
 
   setProvider(provider: 'kokoro' | 'openai') {
-    this.activeProvider = provider;
-    this.failures = [];
+    this.preferredProvider = provider;
     this.emit('provider_set', { provider });
   }
 
@@ -35,54 +70,62 @@ export class TtsRouter extends EventEmitter {
     text: string,
     voice?: string,
   ): Promise<{ audio: Buffer; provider: string }> {
-    const client =
-      this.activeProvider === 'kokoro' ? this.kokoro : this.openai;
-    const defaultVoice =
-      this.activeProvider === 'kokoro' ? 'af_heart' : 'cedar';
+    const primary = this.preferredProvider;
+    const fallback: 'kokoro' | 'openai' =
+      primary === 'kokoro' ? 'openai' : 'kokoro';
+
+    // Try preferred provider first
+    const primaryResult = await this.tryProvider(primary, text, voice);
+    if (primaryResult) return primaryResult;
+
+    // Preferred provider failed or circuit open — try fallback
+    const fallbackResult = await this.tryProvider(fallback, text, voice);
+    if (fallbackResult) return fallbackResult;
+
+    throw new Error(`All TTS providers unavailable (${primary} and ${fallback})`);
+  }
+
+  private async tryProvider(
+    name: 'kokoro' | 'openai',
+    text: string,
+    voice?: string,
+  ): Promise<{ audio: Buffer; provider: string } | null> {
+    const breaker = name === 'kokoro' ? this.kokoroBreaker : this.openaiBreaker;
+    const client = name === 'kokoro' ? this.kokoro : this.openai;
+    const defaultVoice = name === 'kokoro' ? 'af_heart' : 'cedar';
+
+    if (!breaker.canRequest()) return null;
 
     try {
       const audio = await client.synthesize(text, voice || defaultVoice);
-      this.failures = [];
-      return { audio, provider: this.activeProvider };
-    } catch (err) {
-      this.recordFailure();
-      if (this.shouldFallback()) {
-        this.switchProvider();
-        // Retry with alternate provider
-        const altClient =
-          this.activeProvider === 'kokoro' ? this.kokoro : this.openai;
-        const altVoice =
-          this.activeProvider === 'kokoro' ? 'af_heart' : 'cedar';
-        const audio = await altClient.synthesize(text, voice || altVoice);
-        return { audio, provider: this.activeProvider };
-      }
-      throw err;
+      breaker.recordSuccess();
+      return { audio, provider: name };
+    } catch {
+      breaker.recordFailure();
+      return null;
     }
   }
 
   async healthCheck(): Promise<{ kokoro: boolean; openai: boolean }> {
     const [k, o] = await Promise.all([
       this.kokoro.healthCheck(),
-      Promise.resolve(true), // OpenAI doesn't have a health endpoint
+      this.checkOpenAi(),
     ]);
     return { kokoro: k, openai: o };
   }
 
-  private recordFailure() {
-    this.failures.push(Date.now());
-    const cutoff = Date.now() - this.failureWindow;
-    this.failures = this.failures.filter((t) => t > cutoff);
+  /** Real health check for OpenAI — synthesize a short test phrase. */
+  private async checkOpenAi(): Promise<boolean> {
+    try {
+      await this.openai.synthesize('.', 'cedar');
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  private shouldFallback(): boolean {
-    return this.failures.length >= this.failureThreshold;
-  }
-
-  private switchProvider() {
-    const from = this.activeProvider;
-    this.activeProvider =
-      this.activeProvider === 'kokoro' ? 'openai' : 'kokoro';
-    this.failures = [];
-    this.emit('provider_switched', { from, to: this.activeProvider });
+  destroy() {
+    this.kokoroBreaker.destroy();
+    this.openaiBreaker.destroy();
   }
 }

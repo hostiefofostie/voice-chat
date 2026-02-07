@@ -17,12 +17,19 @@ export class TtsPipeline extends EventEmitter {
   private pendingChunks: Map<number, { text: string; turnId: string }> = new Map();
   private nextSendIndex: number = 0;
   private completedAudio: Map<number, Buffer> = new Map();
+  private failedChunks: Set<number> = new Set();
+  private failedTotal: number = 0;
+  private totalChunks: number = 0;
   private inFlight: number = 0;
   private cancelled: boolean = false;
   // Generation counter — incremented on reset() so stale in-flight synthesis
   // from a previous turn does not corrupt state (e.g. decrementing inFlight
   // below zero after reset set it to 0).
   private generation: number = 0;
+
+  // Event-driven drain: resolved when all chunks are settled (completed or failed)
+  private drainResolve: (() => void) | null = null;
+  private drainTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: TtsPipelineOptions) {
     super();
@@ -34,6 +41,7 @@ export class TtsPipeline extends EventEmitter {
 
   async processChunk(text: string, index: number, turnId: string) {
     if (this.cancelled) return;
+    this.totalChunks = Math.max(this.totalChunks, index + 1);
     this.pendingChunks.set(index, { text, turnId });
     await this.dispatch();
   }
@@ -41,6 +49,9 @@ export class TtsPipeline extends EventEmitter {
   async finish() {
     await this.drainAll();
     if (!this.cancelled) {
+      if (this.totalChunks > 0 && this.failedTotal === this.totalChunks) {
+        this.emit('all_failed');
+      }
       this.sendJson({ type: 'tts_done' });
       this.emit('done');
     }
@@ -51,16 +62,21 @@ export class TtsPipeline extends EventEmitter {
     this.pendingChunks.clear();
     this.completedAudio.clear();
     this.sendJson({ type: 'tts_done' });
+    this.resolveDrain();
     this.emit('cancelled');
   }
 
   reset() {
     this.pendingChunks.clear();
     this.completedAudio.clear();
+    this.failedChunks.clear();
+    this.failedTotal = 0;
+    this.totalChunks = 0;
     this.nextSendIndex = 0;
     this.inFlight = 0;
     this.cancelled = false;
     this.generation++;
+    this.resolveDrain();
   }
 
   private async dispatch() {
@@ -85,76 +101,113 @@ export class TtsPipeline extends EventEmitter {
       // belongs to a stale turn.  Ignore it — reset() already zeroed inFlight.
       if (gen !== this.generation) return;
       this.completedAudio.set(index, audio);
-      this.inFlight--;
-      this.sendInOrder();
-      await this.dispatch();
     } catch (err) {
       if (gen !== this.generation) return;
-      this.inFlight--;
+      // TtsRouter already tried fallback provider internally.
+      // If we get here, both providers failed for this chunk.
+      this.failedChunks.add(index);
+      this.failedTotal++;
       this.emit('error', err);
+    } finally {
+      if (gen === this.generation) {
+        this.inFlight--;
+        this.sendInOrder();
+        this.dispatch();
+        this.checkDrained();
+      }
     }
   }
 
   private sendInOrder() {
-    while (this.completedAudio.has(this.nextSendIndex)) {
+    while (true) {
       if (this.cancelled) {
-        // Discard completed audio after cancel — don't send stale chunks
         this.completedAudio.clear();
         return;
       }
 
-      const audio = this.completedAudio.get(this.nextSendIndex)!;
-      this.completedAudio.delete(this.nextSendIndex);
+      if (this.completedAudio.has(this.nextSendIndex)) {
+        const audio = this.completedAudio.get(this.nextSendIndex)!;
+        this.completedAudio.delete(this.nextSendIndex);
 
-      // Parse WAV header for metadata (guard against malformed audio)
-      let sampleRate = 16000;
-      let durationMs = 0;
-      if (audio.length >= 44) {
-        const rawSampleRate = audio.readUInt32LE(24);
-        sampleRate = rawSampleRate || 16000;
-        const dataSize = audio.length - 44;
-        const bytesPerSample = 2; // 16-bit
-        durationMs = rawSampleRate > 0
-          ? Math.round(dataSize / (rawSampleRate * bytesPerSample) * 1000)
-          : 0;
+        // Parse WAV header for metadata (guard against malformed audio)
+        let sampleRate = 16000;
+        let durationMs = 0;
+        if (audio.length >= 44) {
+          const rawSampleRate = audio.readUInt32LE(24);
+          sampleRate = rawSampleRate || 16000;
+          const dataSize = audio.length - 44;
+          const bytesPerSample = 2; // 16-bit
+          durationMs = rawSampleRate > 0
+            ? Math.round(dataSize / (rawSampleRate * bytesPerSample) * 1000)
+            : 0;
+        }
+
+        this.sendJson({
+          type: 'tts_meta',
+          format: 'wav',
+          index: this.nextSendIndex,
+          sampleRate,
+          durationMs,
+        });
+        this.sendBinary(audio);
+
+        this.nextSendIndex++;
+        continue;
       }
 
-      this.sendJson({
-        type: 'tts_meta',
-        format: 'wav',
-        index: this.nextSendIndex,
-        sampleRate,
-        durationMs,
-      });
-      this.sendBinary(audio);
+      if (this.failedChunks.has(this.nextSendIndex)) {
+        // Skip this chunk — both providers failed
+        this.failedChunks.delete(this.nextSendIndex);
+        this.nextSendIndex++;
+        continue;
+      }
 
-      this.nextSendIndex++;
+      // Neither completed nor failed — still in-flight or pending
+      break;
+    }
+  }
+
+  private checkDrained() {
+    if (this.inFlight === 0 && this.pendingChunks.size === 0 && this.drainResolve) {
+      this.sendInOrder();
+      this.resolveDrain();
+    }
+  }
+
+  private resolveDrain() {
+    if (this.drainTimeout) {
+      clearTimeout(this.drainTimeout);
+      this.drainTimeout = null;
+    }
+    if (this.drainResolve) {
+      const resolve = this.drainResolve;
+      this.drainResolve = null;
+      resolve();
     }
   }
 
   private drainAll(): Promise<void> {
+    // If already drained, resolve immediately
+    if (this.inFlight === 0 && this.pendingChunks.size === 0) {
+      this.sendInOrder();
+      return Promise.resolve();
+    }
+
+    if (this.cancelled) {
+      return Promise.resolve();
+    }
+
     const DRAIN_TIMEOUT_MS = 30_000;
     return new Promise((resolve) => {
-      const startedAt = Date.now();
-      const check = () => {
-        if (this.cancelled) {
-          resolve();
-          return;
-        }
-        if (this.inFlight === 0 && this.pendingChunks.size === 0) {
+      this.drainResolve = resolve;
+      this.drainTimeout = setTimeout(() => {
+        if (this.drainResolve === resolve) {
+          this.drainResolve = null;
+          this.drainTimeout = null;
           this.sendInOrder();
           resolve();
-          return;
         }
-        if (Date.now() - startedAt > DRAIN_TIMEOUT_MS) {
-          // Safety timeout — don't hang forever if inFlight is stuck
-          this.sendInOrder();
-          resolve();
-          return;
-        }
-        setTimeout(check, 50);
-      };
-      check();
+      }, DRAIN_TIMEOUT_MS);
     });
   }
 }

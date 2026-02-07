@@ -32,27 +32,22 @@ describe('TtsRouter — failure window expiration', () => {
   });
 
   it('old failures age out of the window', async () => {
-    let failCount = 0;
-    const kokoro = {
-      synthesize: vi.fn(async () => {
-        failCount++;
-        throw new Error('fail');
-      }),
-      healthCheck: vi.fn(async () => false),
-    } as unknown as KokoroClient;
+    const kokoro = createMockKokoro(true);
     const openai = createMockOpenai();
     const router = new TtsRouter(kokoro, openai, 'kokoro');
 
-    // 2 failures
-    await expect(router.synthesize('a')).rejects.toThrow();
-    await expect(router.synthesize('b')).rejects.toThrow();
+    // 2 failures (each falls back to openai per-request)
+    await router.synthesize('a');
+    await router.synthesize('b');
 
     // Advance past the 60s failure window
     vi.advanceTimersByTime(61_000);
 
-    // Third failure should not trigger fallback (old ones aged out)
-    await expect(router.synthesize('c')).rejects.toThrow();
-    expect(router.provider).toBe('kokoro'); // Still on kokoro
+    // Third failure should not trip breaker (old ones aged out)
+    await router.synthesize('c');
+    expect(router.circuitStateOf('kokoro')).toBe('closed');
+    expect(router.provider).toBe('kokoro');
+    router.destroy();
   });
 
   it('failures within window accumulate to threshold', async () => {
@@ -60,18 +55,18 @@ describe('TtsRouter — failure window expiration', () => {
     const openai = createMockOpenai();
     const router = new TtsRouter(kokoro, openai, 'kokoro');
 
-    // 3 failures rapidly
-    await expect(router.synthesize('a')).rejects.toThrow();
-    await expect(router.synthesize('b')).rejects.toThrow();
-    // Third triggers fallback to openai
-    const result = await router.synthesize('c');
-    expect(result.provider).toBe('openai');
-    expect(router.provider).toBe('openai');
+    // 3 failures rapidly — trips the breaker
+    await router.synthesize('a');
+    await router.synthesize('b');
+    await router.synthesize('c');
+
+    expect(router.circuitStateOf('kokoro')).toBe('open');
+    router.destroy();
   });
 });
 
 describe('TtsRouter — success clears failures', () => {
-  it('a success after failures resets the failure array', async () => {
+  it('a success after failures resets the failure count', async () => {
     let callCount = 0;
     const kokoro = {
       synthesize: vi.fn(async () => {
@@ -84,20 +79,24 @@ describe('TtsRouter — success clears failures', () => {
     const openai = createMockOpenai();
     const router = new TtsRouter(kokoro, openai, 'kokoro');
 
-    // 2 failures (below threshold)
-    await expect(router.synthesize('a')).rejects.toThrow();
-    await expect(router.synthesize('b')).rejects.toThrow();
+    // 2 failures (fall back to openai each time)
+    const r1 = await router.synthesize('a');
+    expect(r1.provider).toBe('openai');
+    const r2 = await router.synthesize('b');
+    expect(r2.provider).toBe('openai');
 
     // Success on 3rd call — should clear failure count
     const result = await router.synthesize('c');
     expect(result.audio.toString()).toBe('ok');
-    expect(router.provider).toBe('kokoro');
+    expect(result.provider).toBe('kokoro');
+    expect(router.circuitStateOf('kokoro')).toBe('closed');
 
-    // Now another 2 failures should NOT trigger fallback (counter was reset)
-    callCount = 0; // Reset the mock
-    await expect(router.synthesize('d')).rejects.toThrow();
-    await expect(router.synthesize('e')).rejects.toThrow();
-    expect(router.provider).toBe('kokoro'); // Still on kokoro
+    // Now another 2 failures should NOT trip breaker (counter was reset)
+    callCount = 0;
+    await router.synthesize('d');
+    await router.synthesize('e');
+    expect(router.circuitStateOf('kokoro')).toBe('closed');
+    router.destroy();
   });
 });
 
@@ -112,24 +111,28 @@ describe('TtsRouter — setProvider', () => {
     expect(result.provider).toBe('openai');
     expect(openai.synthesize).toHaveBeenCalled();
     expect(kokoro.synthesize).not.toHaveBeenCalled();
+    router.destroy();
   });
 
-  it('switching back after fallback works', async () => {
+  it('switching back after circuit breaker trip works', async () => {
     const kokoro = createMockKokoro(true);
     const openai = createMockOpenai();
     const router = new TtsRouter(kokoro, openai, 'kokoro');
 
-    // Trigger automatic fallback
+    // Trip kokoro breaker
     for (let i = 0; i < 3; i++) {
-      try { await router.synthesize('test'); } catch {}
+      await router.synthesize('test');
     }
-    // Now on openai
-    const result1 = await router.synthesize('after fallback');
+    expect(router.circuitStateOf('kokoro')).toBe('open');
+
+    // All requests still work via openai fallback
+    const result1 = await router.synthesize('after trip');
     expect(result1.provider).toBe('openai');
 
-    // Manually switch back (e.g., /tts kokoro command)
+    // Manually switch preference to kokoro (breaker is still open though)
     router.setProvider('kokoro');
     expect(router.provider).toBe('kokoro');
+    router.destroy();
   });
 });
 
@@ -141,7 +144,8 @@ describe('TtsRouter — healthCheck', () => {
 
     const status = await router.healthCheck();
     expect(status.kokoro).toBe(true);
-    expect(status.openai).toBe(true); // OpenAI always returns true
+    expect(status.openai).toBe(true);
+    router.destroy();
   });
 
   it('reports kokoro as unhealthy when health check fails', async () => {
@@ -155,5 +159,63 @@ describe('TtsRouter — healthCheck', () => {
     const status = await router.healthCheck();
     expect(status.kokoro).toBe(false);
     expect(status.openai).toBe(true);
+    router.destroy();
+  });
+
+  it('reports openai as unhealthy when synthesize fails', async () => {
+    const kokoro = createMockKokoro();
+    const openai = createMockOpenai(true);
+    const router = new TtsRouter(kokoro, openai);
+
+    const status = await router.healthCheck();
+    expect(status.kokoro).toBe(true);
+    expect(status.openai).toBe(false);
+    router.destroy();
+  });
+});
+
+describe('TtsRouter — circuit state', () => {
+  it('exposes circuit state per provider', async () => {
+    const kokoro = createMockKokoro(true);
+    const openai = createMockOpenai();
+    const router = new TtsRouter(kokoro, openai, 'kokoro');
+
+    expect(router.circuitStateOf('kokoro')).toBe('closed');
+    expect(router.circuitStateOf('openai')).toBe('closed');
+
+    // Trip kokoro
+    for (let i = 0; i < 3; i++) {
+      await router.synthesize('test');
+    }
+
+    expect(router.circuitStateOf('kokoro')).toBe('open');
+    expect(router.circuitStateOf('openai')).toBe('closed');
+    router.destroy();
+  });
+
+  it('emits circuit_state events', async () => {
+    const kokoro = createMockKokoro(true);
+    const openai = createMockOpenai();
+    const router = new TtsRouter(kokoro, openai, 'kokoro');
+
+    const handler = vi.fn();
+    router.on('circuit_state', handler);
+
+    for (let i = 0; i < 3; i++) {
+      await router.synthesize('test');
+    }
+
+    expect(handler).toHaveBeenCalledWith({
+      provider: 'kokoro',
+      from: 'closed',
+      to: 'open',
+    });
+    router.destroy();
+  });
+
+  it('destroy cleans up circuit breaker timers', () => {
+    const router = new TtsRouter(createMockKokoro(), createMockOpenai());
+    router.destroy();
+    // Should not throw or leak timers
   });
 });

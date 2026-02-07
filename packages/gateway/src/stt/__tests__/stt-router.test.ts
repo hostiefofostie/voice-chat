@@ -44,7 +44,7 @@ describe('SttRouter', () => {
       await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow('Parakeet offline');
     }
 
-    // Third failure hits threshold — switches permanently to fallback
+    // Third failure hits threshold — switches to fallback
     const result = await router.transcribe(Buffer.alloc(100));
     expect(result.text).toBe('[STT unavailable - local provider offline]');
     expect(router.activeProvider).toBe('cloud_stub');
@@ -66,11 +66,11 @@ describe('SttRouter', () => {
 
     const router = new SttRouter(client);
 
-    // Call 1: success → consecutiveFailures = 0
+    // Call 1: success -> failures reset
     await router.transcribe(Buffer.alloc(100));
-    // Call 2: fail → consecutiveFailures = 1, throws (below threshold)
+    // Call 2: fail -> 1 failure, throws (below threshold)
     await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow('temporary');
-    // Call 3: success → consecutiveFailures = 0
+    // Call 3: success -> failures reset
     await router.transcribe(Buffer.alloc(100));
 
     // Not switched because never hit threshold
@@ -78,10 +78,10 @@ describe('SttRouter', () => {
     router.destroy();
   });
 
-  it('auto-recovers when health check succeeds', async () => {
+  it('auto-recovers via circuit breaker half-open probe', async () => {
     vi.useFakeTimers();
     const client = createMockClient(true);
-    const router = new SttRouter(client);
+    const router = new SttRouter(client, { cooldownMs: 5_000 });
 
     const recoveredHandler = vi.fn();
     router.on('provider_recovered', recoveredHandler);
@@ -92,26 +92,30 @@ describe('SttRouter', () => {
     }
     await router.transcribe(Buffer.alloc(100));
     expect(router.activeProvider).toBe('cloud_stub');
+    expect(router.circuitState).toBe('open');
 
-    // Now make health check succeed
-    (client.healthCheck as any).mockResolvedValue(true);
+    // Make primary succeed now
+    (client.transcribe as any).mockResolvedValue(mockResult('recovered'));
 
-    // Advance past the 15s health check interval
-    await vi.advanceTimersByTimeAsync(15001);
+    // Advance past cooldown -> half_open
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(router.circuitState).toBe('half_open');
 
+    // Next transcribe is the probe — should succeed and close the breaker
+    const result = await router.transcribe(Buffer.alloc(100));
+    expect(result.text).toBe('recovered');
     expect(router.activeProvider).toBe('parakeet');
+    expect(router.circuitState).toBe('closed');
     expect(recoveredHandler).toHaveBeenCalledWith({ provider: 'parakeet' });
 
     router.destroy();
   });
 
-  it('destroy clears health check interval', () => {
+  it('destroy clears circuit breaker timers', () => {
     vi.useFakeTimers();
     const client = createMockClient(true);
     const router = new SttRouter(client);
 
-    // Force into fallback to start health checks
-    // We'll just destroy immediately
     router.destroy();
 
     // Advancing time should not cause any errors
@@ -130,6 +134,47 @@ describe('SttRouter', () => {
     const result = await router.transcribe(Buffer.alloc(100));
     expect(result.confidence).toBe(0);
     expect(result.segments).toEqual([]);
+    router.destroy();
+  });
+
+  it('exposes circuit state', async () => {
+    vi.useFakeTimers();
+    const client = createMockClient(true);
+    const router = new SttRouter(client, { cooldownMs: 5_000 });
+
+    expect(router.circuitState).toBe('closed');
+
+    // Trip the breaker
+    for (let i = 0; i < 2; i++) {
+      await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow();
+    }
+    await router.transcribe(Buffer.alloc(100));
+    expect(router.circuitState).toBe('open');
+
+    // Wait for half_open
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(router.circuitState).toBe('half_open');
+
+    router.destroy();
+  });
+
+  it('emits circuit_state events', async () => {
+    const client = createMockClient(true);
+    const router = new SttRouter(client);
+
+    const handler = vi.fn();
+    router.on('circuit_state', handler);
+
+    for (let i = 0; i < 2; i++) {
+      await expect(router.transcribe(Buffer.alloc(100))).rejects.toThrow();
+    }
+    await router.transcribe(Buffer.alloc(100));
+
+    expect(handler).toHaveBeenCalledWith({
+      provider: 'parakeet',
+      from: 'closed',
+      to: 'open',
+    });
     router.destroy();
   });
 });
