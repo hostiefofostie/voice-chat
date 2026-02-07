@@ -18,6 +18,8 @@ export interface UseAudioPlaybackReturn {
   markDone: () => void;
   stop: () => void;
   setVolume: (vol: number) => void;
+  /** Warm up AudioContext during a user gesture so playback works later. */
+  warmup: () => Promise<void>;
 }
 
 interface QueuedChunk {
