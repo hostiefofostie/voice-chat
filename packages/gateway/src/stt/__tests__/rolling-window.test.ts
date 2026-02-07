@@ -233,4 +233,54 @@ describe('RollingWindowSTT — Integration', () => {
     // Check PCM data size in header
     expect(wav.readUInt32LE(40)).toBe(100);
   });
+
+  it('stop() returns full audio as WAV and stops timer', () => {
+    vi.useFakeTimers();
+    const client = createMockClient(['hello']);
+    const stt = new RollingWindowSTT(client);
+
+    stt.start();
+    stt.appendAudio(Buffer.alloc(100));
+    stt.appendAudio(Buffer.alloc(200));
+
+    const wav = stt.stop();
+
+    // WAV header (44 bytes) + all PCM data (300 bytes)
+    expect(wav.length).toBe(344);
+    expect(wav.toString('ascii', 0, 4)).toBe('RIFF');
+    expect(wav.readUInt32LE(40)).toBe(300);
+
+    // Timer should be stopped — no transcribe calls on advance
+    vi.advanceTimersByTime(2000);
+    expect(client.transcribe).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
+  it('stop() returns WAV with empty PCM when no audio', () => {
+    const client = createMockClient([]);
+    const stt = new RollingWindowSTT(client);
+
+    const wav = stt.stop();
+    // 44-byte header + 0 bytes of PCM
+    expect(wav.length).toBe(44);
+    expect(wav.readUInt32LE(40)).toBe(0);
+  });
+
+  it('decodeCycle emits error on transcribe failure without stopping', async () => {
+    const failingClient = {
+      transcribe: vi.fn(async () => { throw new Error('Parakeet timeout'); }),
+    } as unknown as ParakeetClient;
+    const stt = new RollingWindowSTT(failingClient);
+    const errorHandler = vi.fn();
+    stt.on('error', errorHandler);
+
+    feedDummyAudio(stt);
+    await (stt as any).decodeCycle();
+
+    expect(errorHandler).toHaveBeenCalledTimes(1);
+    expect(errorHandler.mock.calls[0][0].message).toBe('Parakeet timeout');
+    // inFlight should be reset so next cycle can proceed
+    expect((stt as any).inFlight).toBe(false);
+  });
 });

@@ -59,6 +59,16 @@ export class RollingWindowSTT extends EventEmitter {
     return { text: result.text };
   }
 
+  /**
+   * Stop the periodic timer and return all accumulated audio as a WAV buffer.
+   * Does NOT perform a final decode — the caller is responsible for transcribing
+   * through the SttRouter (which has proper failover via circuit breaker).
+   */
+  stop(): Buffer {
+    this.stopTimer();
+    return this.buildWav(Buffer.concat(this.audioBuffer));
+  }
+
   /** Stop timer and clear all accumulated state. */
   reset() {
     this.stopTimer();
