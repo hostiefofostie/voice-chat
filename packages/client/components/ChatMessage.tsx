@@ -8,7 +8,7 @@ interface ChatMessageProps {
   timestamp?: number;
 }
 
-export default function ChatMessage({ role, text, isStreaming }: ChatMessageProps) {
+export default React.memo(function ChatMessage({ role, text, isStreaming }: ChatMessageProps) {
   const isUser = role === 'user';
   const cursorOpacity = useRef(new Animated.Value(1)).current;
 
@@ -39,7 +39,7 @@ export default function ChatMessage({ role, text, isStreaming }: ChatMessageProp
       </View>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
   row: {
