@@ -2,31 +2,12 @@
 // These types define the contract between client and server.
 
 // ---------------------------------------------------------------------------
-// Turn State Machine
+// Turn State Machine (re-exported from shared module)
 // ---------------------------------------------------------------------------
 
-/** Represents the current phase of a voice conversation turn. */
-export type TurnState =
-  | 'idle'          // Not listening, not processing
-  | 'listening'     // VAD detected speech, audio streaming
-  | 'transcribing'  // VAD endpoint, running STT
-  | 'pending_send'  // Transcript ready, user can edit before send
-  | 'thinking'      // Sent to LLM, tokens streaming
-  | 'speaking';     // TTS audio playing
-
-/**
- * Valid state transitions for the turn state machine.
- * Server is authoritative; client may optimistically transition but
- * reconciles on `turn_state` messages.
- */
-export const VALID_TRANSITIONS: Record<TurnState, TurnState[]> = {
-  idle: ['listening'],
-  listening: ['transcribing', 'idle'],    // idle via barge-in cancel
-  transcribing: ['pending_send', 'listening', 'idle'], // listening if new audio arrives mid-STT; idle on empty/error
-  pending_send: ['thinking', 'listening', 'idle'],     // listening if user resumes speaking; idle via cancel
-  thinking: ['speaking', 'idle'],         // idle via cancel
-  speaking: ['idle', 'listening'],        // listening via barge-in
-};
+import { type TurnState as _TurnState } from './shared/turn-fsm.js';
+export type TurnState = _TurnState;
+export { type TurnEvent, transition, VALID_TRANSITIONS } from './shared/turn-fsm.js';
 
 // ---------------------------------------------------------------------------
 // Session Config

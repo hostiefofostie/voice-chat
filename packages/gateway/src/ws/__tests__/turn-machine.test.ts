@@ -82,14 +82,14 @@ describe('TurnMachine', () => {
       expect(machine.currentState).toBe('idle');
     });
 
-    it('speaking -> listening (barge-in)', () => {
+    it('speaking -> listening is no longer valid (barge-in goes idle first)', () => {
       machine.transition('listening');
       machine.transition('transcribing');
       machine.transition('pending_send');
       machine.transition('thinking');
       machine.transition('speaking');
-      expect(machine.transition('listening')).toBe(true);
-      expect(machine.currentState).toBe('listening');
+      expect(machine.transition('listening')).toBe(false);
+      expect(machine.currentState).toBe('speaking');
     });
 
     it('full happy path: idle -> listening -> transcribing -> pending_send -> thinking -> speaking -> idle', () => {
@@ -104,9 +104,9 @@ describe('TurnMachine', () => {
   });
 
   describe('invalid transitions', () => {
-    it('idle -> thinking (skip)', () => {
-      expect(machine.transition('thinking')).toBe(false);
-      expect(machine.currentState).toBe('idle');
+    it('idle -> thinking (now valid for text-input sends)', () => {
+      expect(machine.transition('thinking')).toBe(true);
+      expect(machine.currentState).toBe('thinking');
     });
 
     it('idle -> speaking', () => {
